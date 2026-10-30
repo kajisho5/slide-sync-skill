@@ -29,7 +29,7 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters) and `loo
   - Done when: page count + text fixture
 - [x] **3. DETECT_CHANGES op** — screen recording -> change times (0.1.0, `detect`)
   - Done when: synthetic slideshow, +/-1 frame
-- [ ] **4. MATCH op** — changes -> slide index
+- [x] **4. MATCH op** — changes -> slide index ([#5](https://github.com/kajisho5/slide-sync-skill/pull/5), `match`; ADR-002)
   - Done when: shuffled-slides fixture
 - [ ] **5. Chapters / insert clips** — via ffmpeg-skill metadata and insert (chapters done in 0.1.0; insert clips remains)
   - Done when: chapters in the output
