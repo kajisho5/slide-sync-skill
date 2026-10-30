@@ -5,13 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "slide-sync-skill"
 version = "0.1.0"
-description = "Slide changes in a talk recording, as a slide timeline and chapters. Detection and chapter writing run on ffmpeg-skill; local, no network."
+description = "Slide changes in a talk recording, as a slide timeline and chapters, and a slide deck as page images and text. Detection and chapter writing run on ffmpeg-skill; local, no network."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [{name = "kajisho5"}]
-keywords = ["slides", "chapters", "lecture", "conference", "recording", "scene-detection", "agent-skill", "video-production"]
+keywords = ["slides", "chapters", "lecture", "conference", "recording", "scene-detection", "agent-skill", "video-production", "pdf", "pptx"]
 dependencies = []
+
+[project.optional-dependencies]
+# Slide import (`slide-sync import`, docs/decisions.md ADR-001). pypdfium2 is Apache-2.0 OR BSD-3-Clause; PDFium is BSD-3-Clause.
+# PPTX / PPT / KEY / ODP also need LibreOffice (MPL-2.0), a system install, not a Python package.
+pdf = ["pypdfium2>=4.30"]
 
 [project.scripts]
 slide-sync = "slide_sync.cli:main"

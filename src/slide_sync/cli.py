@@ -4,10 +4,12 @@
   slide-sync detect talk.mp4 --sheet sheet.png -o timeline.json
   slide-sync chapters talk.mp4 --timeline timeline.json --chapters-out chapters.txt
   slide-sync chapters talk.mp4 --titles titles.txt --min-chapter 10 -o talk_chapters.mp4
+  slide-sync import deck.pdf -o pages/ --json            # page PNGs + page text (pptx/key via LibreOffice)
   slide-sync contract --json
   slide-sync doctor --json
 
-Exit codes: 0 done, 2 invalid input or arguments, 3 ffmpeg-skill not found or missing a tool, 4 ffmpeg-skill failed.
+Exit codes: 0 done, 2 invalid input or arguments, 3 ffmpeg-skill, pypdfium2 or LibreOffice not found (or missing a tool),
+4 ffmpeg-skill or LibreOffice failed.
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from . import __version__
 from .contract import ERRORS, contract
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, SlideSyncError, chapters, detect, read_titles, write_chapters
+from .deck import DEFAULT_DPI, MAX_DPI, MIN_DPI, import_deck, pdfium_status, soffice_status
 from .engine import REQUIRED_TOOLS, EngineError, FfmpegSkill, candidates, engine_doctor, locate
 
 
@@ -94,6 +97,15 @@ def cmd_chapters(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import(a: argparse.Namespace) -> int:
+    m = import_deck(a.deck, a.output, dpi=a.dpi, overwrite=a.overwrite, soffice=a.soffice, timeout=a.timeout)
+    out_dir = os.path.abspath(a.output)
+    lines = [f"{m['page_count']} page(s) at {m['renderer']['dpi']:g} dpi -> {out_dir}"]
+    lines += [f"  {p['index']:>3}  {p['image']}  {p['width_px']}x{p['height_px']}  {p['chars']} chars" for p in m["pages"]]
+    _emit(dict(m, ok=True, output_dir=out_dir), a.json, "\n".join(lines))
+    return 0
+
+
 def cmd_contract(a: argparse.Namespace) -> int:
     _emit(contract(), True)
     return 0
@@ -115,9 +127,16 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         if not d["ok"]:
             problems.append(d["detail"] or "ffmpeg-skill doctor reports a problem (ffmpeg, ffprobe or a needed tool)")
         engine["ok"] = not problems
+    # Slide import is optional: a missing pypdfium2 or LibreOffice is reported (with how to install it) but does not
+    # make doctor fail, because detect and chapters do not need them.
+    pdf, office = pdfium_status(), soffice_status(a.soffice)
+    slide_import = {"pdf": dict(pdf, ready=pdf["found"]), "libreoffice": office,
+                    "ready": {"pdf": pdf["found"], "pptx_key_odp": pdf["found"] and office["found"]}}
+    notes = [f"slide import: {name} not found; {d['install']}" for name, d in (("pypdfium2", pdf), ("LibreOffice", office))
+             if not d["found"]]
     doc = {"ok": not problems, "skill": "slide-sync-skill", "version": __version__,
-           "python": platform.python_version(), "engine": engine, "problems": problems}
-    human = "OK" if not problems else "\n".join(f"problem: {p}" for p in problems)
+           "python": platform.python_version(), "engine": engine, "import": slide_import, "problems": problems, "notes": notes}
+    human = "\n".join((["OK"] if not problems else [f"problem: {p}" for p in problems]) + [f"note: {n}" for n in notes])
     _emit(doc, a.json, human)
     return 0 if not problems else 3
 
@@ -156,12 +175,24 @@ def parser() -> argparse.ArgumentParser:
     common(c)
     c.set_defaults(func=cmd_chapters)
 
+    im = sub.add_parser("import", help="page PNGs and page text of a slide deck (PDF; pptx/ppt/key/odp via LibreOffice)")
+    im.add_argument("deck", help="a .pdf, or .pptx / .ppt / .key / .odp when LibreOffice is installed")
+    im.add_argument("-o", "--output", required=True, help="directory for page-NNN.png, page-NNN.txt and deck.json")
+    im.add_argument("--dpi", type=float, default=DEFAULT_DPI,
+                    help=f"render resolution, {MIN_DPI:g}-{MAX_DPI:g} (default {DEFAULT_DPI:g}: a 16:9 PowerPoint slide is 1920x1080)")
+    im.add_argument("--soffice", help="LibreOffice soffice binary (default: $SLIDE_SYNC_SOFFICE, PATH, the usual install places)")
+    im.add_argument("--timeout", type=float, default=600.0, help="seconds for the LibreOffice conversion (default 600)")
+    im.add_argument("--overwrite", action="store_true", help="replace page files and deck.json already in the directory")
+    im.add_argument("--json", action="store_true", help="print one JSON document")
+    im.set_defaults(func=cmd_import)
+
     k = sub.add_parser("contract", help="machine-readable contract")
     k.add_argument("--json", action="store_true")
     k.set_defaults(func=cmd_contract)
 
     dr = sub.add_parser("doctor", help="environment check")
     dr.add_argument("--ffmpeg-skill")
+    dr.add_argument("--soffice", help="LibreOffice soffice binary to check")
     dr.add_argument("--json", action="store_true")
     dr.set_defaults(func=cmd_doctor)
     return p

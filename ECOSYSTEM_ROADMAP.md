@@ -6,6 +6,7 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 ## Where it stands
 
 0.1.0: `detect` (slide timeline from ffmpeg-skill scenes, min-dwell filter, contact sheet) and `chapters` (chapter text, container chapters through ffmpeg-skill metadata), with contract and doctor. Stdlib only; unit tests plus integration tests on the real engine.
+Since then: `import` (deck -> per-page PNG + text; pypdfium2 as the optional `pdf` extra, LibreOffice for PPTX / KEY; ADR-001 in `docs/decisions.md`).
 
 ## What this repository owns
 
@@ -13,18 +14,18 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 
 | Owned job | Status | Note |
 |---|---|---|
-| スライド取込 | missing | PDF/PPTX -> page images + text (pypdfium2 or poppler; PyMuPDF is AGPL; LibreOffice for PPTX -- to verify) |
+| スライド取込 | done | `import`: PDF -> page PNGs + text through pypdfium2 (Apache-2.0 OR BSD-3-Clause; PyMuPDF AGPL and Poppler GPL rejected); PPTX / KEY / ODP via LibreOffice when installed ([#4](https://github.com/kajisho5/slide-sync-skill/pull/4)) |
 | スライド切替検出 | done | 0.1.0: ffmpeg-skill scenes + min-dwell; frame-hash refinement not needed on the fixtures, revisit with real recordings |
 
 ## Wiring
 
-ffmpeg-skill `scenes` (detection, contact sheet) and `metadata` (chapters). No agent adapter yet (step 6).
+ffmpeg-skill `scenes` (detection, contact sheet) and `metadata` (chapters). Import uses pypdfium2 (optional extra `pdf`) and, for non-PDF decks, a system LibreOffice; neither goes through ffmpeg-skill. No agent adapter yet (step 6).
 
 ## Steps
 
 - [x] **1. Skeleton + contract/doctor + slide-timeline schema** (0.1.0)
   - Done when: OS static checks PASS
-- [ ] **2. IMPORT op** — PDF -> PNG + text; PPTX via LibreOffice if present
+- [x] **2. IMPORT op** — PDF -> PNG + text; PPTX via LibreOffice if present ([#4](https://github.com/kajisho5/slide-sync-skill/pull/4), `import`)
   - Done when: page count + text fixture
 - [x] **3. DETECT_CHANGES op** — screen recording -> change times (0.1.0, `detect`)
   - Done when: synthetic slideshow, +/-1 frame
