@@ -156,3 +156,59 @@ Three fixtures, all generated at test time:
 
 - Text as a tie-breaker, once detection-skill offers OCR output in a shape this skill can read.
 - A `chapters` option to title chapters from matched pages (a page's first text line), and merging consecutive segments on the same page.
+
+## ADR-003 Insert clips: splice at slide boundaries through ffmpeg-skill cut / insert / join, shift the timeline by measured lengths
+
+Decided 2026-10-30, checked against ffmpeg-skill 2.21.0 (`scripts/_contract.py --json --static`).
+
+### Requirements
+
+`ECOSYSTEM_ROADMAP.md` step 5 ("Chapters / insert clips, via ffmpeg-skill metadata and insert"). Chapters were done in 0.1.0; this is the second half: put a clip (a demo video, the video a slide embeds, a still such as a deck page or a title card) into the talk at a slide boundary, and keep the slide timeline and chapters right. Done when the chapters are in the output.
+
+- **ffmpeg-skill does the media work.** This skill never runs ffmpeg itself (`engine.py`, and a test checks it).
+- **Consistent timeline.** Every slide after an insertion moves later by what was inserted; the chapters of the output say where each slide and each clip now starts.
+- **Provenance.** The output's timeline says it is derived, from which measured timeline, by which edits, with which engine steps.
+- **Input read-only**, existing outputs refused without `--overwrite`, as everywhere in this skill.
+
+### What ffmpeg-skill offers
+
+| Tool | What it does (contract) | Use here |
+|---|---|---|
+| `insert` | "Turn a still image into a silent, timed video clip": `--duration`, `--width` / `--height` (fill and centre-crop, never distorted), `--fps` | A still clip, at the recording's size and rate |
+| `cut` | One span of a video; `--accurate` re-encodes for a frame-exact cut (the default stream copy snaps to keyframes) | The recording split at each boundary that gets a clip |
+| `join` | Clips in order, normalising size (pad), frame rate and audio layout; `--transition none` butts them with the concat filter; a clip with no audio stream is joined over generated silence; every clip is trimmed to its probed duration | The parts and clips, in order |
+| `probe` | Duration, size, frame rate | The recording's size / rate, each video clip's length |
+| `metadata` | Container chapters, streams copied | The shifted chapters |
+
+`insert` alone cannot put a video into another one: its input is a still image. So "insert a clip" is `cut` + `join`, with `insert` for stills. There is no ffmpeg-skill tool that splices at a time in one step (`broll` overlays, it does not lengthen the video; `render` executes plans of the same tools).
+
+### Decision
+
+- **One op, `slide-sync insert <video> --insert N=CLIP [...] -o <video>`.** `N` is a slide of the timeline; the clip goes after it (0: before slide 1). Repeat `--insert` for more clips; several at one boundary go in in the order given. An image extension (`png`, `jpg`, `jpeg`, `webp`, `bmp`, `tif`, `tiff`) is a still of `--still-duration` seconds (default 5); anything else is a video, used as it is.
+  - A slide index, not a time: a boundary is where a slide ends, so a clip never lands inside a slide, and the timeline already knows where that is.
+  - `--insert-title` names the clips' chapters in `--insert` order; without one, a clip's chapter is its file name (no invented titles).
+- **Steps.** `probe` the recording (size, rate, length) -> `insert` each still at that size and rate / `probe` each video clip -> `cut --accurate` the recording at each boundary that gets a clip (none when the clips go only at the start or the end) -> `join --transition none --width W --height H --fps F` -> `metadata --chapters` into `-o`.
+  - `--accurate`: the join re-encodes anyway, and a stream-copy cut would snap the boundary to a keyframe, seconds away in a screen recording.
+  - The recording's size and rate are passed to `join` explicitly; its default is the first clip's, which is the inserted clip when one goes at the start.
+  - The cost is two encodes of the talk (cut, then join) at ffmpeg-skill's default quality (CRF 18). A single-pass splice would need a filter graph built here, which this skill does not do.
+- **Shifting.** A pure function, `shift_timeline(timeline, inserts)`: a slide moves by the sum of the durations inserted before it; each clip becomes a segment of its own, `kind: insert`, with its `title`; segments are renumbered 1..m and a slide keeps its `source_slide`, so `--titles` (one per slide of the recording) and `Slide N` still name the recording's slides. Shifting a shifted timeline keeps working (edits accumulate).
+  - The shift is the clip's **measured** duration (ffmpeg-skill `probe`, or `insert`'s own probe), the same number `join` trims the clip to, not the requested `--still-duration`.
+  - After the join, its measured length is compared with the predicted one (recording + clips) and recorded as `render.drift`; more than 1.5 frames is a warning. On the integration fixture it is 0.
+- **Output.** The shifted timeline is still `slide-sync/timeline@1`, so `chapters` and `match` read it, with:
+  - `provenance: DERIVED` and `derived_from` (path, duration, provenance and slide count of the measured timeline);
+  - `edits`: per clip, `after_slide`, `at_source`, `at_output`, measured `duration`, the shift after it, `title`, the clip's path, kind (`video` / `still`) and sha256;
+  - `render`: every ffmpeg-skill step (tool, requested and measured lengths, cut mode, join notes such as generated silence), the engine version, the drift.
+  `--timeline-out` writes it, `--chapters-out` the chapter text; `--json` prints it.
+- **Engine tools.** `probe`, `cut`, `insert`, `join`, `metadata` (`INSERT_TOOLS`) are checked by `insert` only (`ENGINE_TOOL_MISSING`, exit 3). `doctor` reports whether they are usable as a note, so a missing one does not fail detect / chapters / match.
+
+### Evidence
+
+- **Unit (`ShiftTimelineTests`, `InsertOpTests`).** Shifting after a slide, at the start, at the end and several at one boundary; a shifted timeline shifted again; chapters and titles after the shift; `min_chapter` merging a short clip; bad slide numbers and durations. With ffmpeg-skill faked: the order and arguments of every call (cut boundaries, `--accurate`, the still at the recording's size and rate, the join order, `--transition none`), the chapter file handed to `metadata`, no cut when clips go only at the ends, the drift warning, every refusal before anything runs.
+- **Integration (`IntegrationTests.test_inserted_clips_shift_the_slides_and_chapters`, real ffmpeg-skill).** Three 4 s slides at 320 x 180 / 25 fps; a 2 s 320 x 240 / 30 fps demo with sound after slide 1 and a 640 x 360 still for 1.5 s after slide 2. The output's container chapters are at 0, 4, 6, 10, 11.5 s within one frame, the output is 15.5 s, and the frame in the middle of every segment of the shifted timeline has that segment's colour.
+
+### Limits
+
+- The talk is re-encoded twice. For a final master, keep the original and treat this output as a delivery copy.
+- A clip of another aspect ratio is padded (join's default `--fit pad`), not cropped.
+- Clips go only at slide boundaries. A clip inside a slide, a cross-fade, or cutting parts of the talk out is editing: video-editing-skill.
+- `match` on the output gives the inserted segments `page: null` (they are not deck pages), as it should.

@@ -6,6 +6,7 @@
   slide-sync chapters talk.mp4 --titles titles.txt --min-chapter 10 -o talk_chapters.mp4
   slide-sync import deck.pdf -o pages/ --json            # page PNGs + page text (pptx/key via LibreOffice)
   slide-sync match talk.mp4 --deck pages/ --timeline timeline.json -o match.json   # which page is on screen when
+  slide-sync insert talk.mp4 --timeline timeline.json --insert 3=demo.mp4 --insert 5=pages/page-006.png -o talk_demo.mp4
   slide-sync contract --json
   slide-sync doctor --json
 
@@ -25,7 +26,8 @@ from . import __version__
 from .contract import ERRORS, contract
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, SlideSyncError, chapters, detect, read_titles, write_chapters
 from .deck import DEFAULT_DPI, MAX_DPI, MIN_DPI, import_deck, pdfium_status, soffice_status
-from .engine import REQUIRED_TOOLS, EngineError, FfmpegSkill, candidates, engine_doctor, locate
+from .engine import INSERT_TOOLS, REQUIRED_TOOLS, EngineError, FfmpegSkill, candidates, engine_doctor, locate
+from .insert import DEFAULT_STILL_DURATION, insert_clips, parse_insert
 from .match import DEFAULT_MIN_MARGIN, DEFAULT_MIN_SCORE, DEFAULT_SAMPLES, MAX_SAMPLES, match
 
 
@@ -130,6 +132,29 @@ def cmd_match(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_insert(a: argparse.Namespace) -> int:
+    inserts = [parse_insert(spec) for spec in a.insert]
+    for path in (a.timeline_out, a.chapters_out):  # before the slow part
+        if path and os.path.exists(path) and not a.overwrite:
+            raise SlideSyncError("INVALID_ARGUMENT", f"refusing to overwrite {path}: pass --overwrite")
+    skill = _engine(a.ffmpeg_skill)
+    tl = _timeline(a, skill)
+    r = insert_clips(skill, a.video, tl, inserts, a.output, titles=read_titles(a.titles), insert_titles=a.insert_title,
+                     prefix=a.prefix, min_chapter=a.min_chapter, still_duration=a.still_duration, overwrite=a.overwrite,
+                     timeout=a.timeout)
+    if a.timeline_out:
+        _write_json(a.timeline_out, r["timeline"], a.overwrite)
+    if a.chapters_out:
+        with open(a.chapters_out, "w", encoding="utf-8") as fh:
+            fh.write(r["text"])
+    doc = {"ok": True, "video": os.path.abspath(a.video), "output": r["output"], "inserted_count": len(inserts),
+           "chapter_count": len(r["chapters"]), "chapters": r["chapters"], "text": r["text"], "warnings": r["warnings"],
+           "timeline": r["timeline"], "timeline_file": a.timeline_out, "chapters_file": a.chapters_out}
+    human = r["text"] + "".join(f"warning: {w}\n" for w in r["warnings"]) + f"wrote {r['output']}\n"
+    _emit(doc, a.json, human.rstrip("\n"))
+    return 0
+
+
 def cmd_contract(a: argparse.Namespace) -> int:
     _emit(contract(), True)
     return 0
@@ -147,7 +172,7 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         if engine["missing_tools"]:
             problems.append("ffmpeg-skill lacks: " + ", ".join(engine["missing_tools"]))
         d = engine_doctor(skill)
-        engine.update(ffmpeg=d["ffmpeg"], ffprobe=d["ffprobe"], tools=d["tools"])
+        engine.update(ffmpeg=d["ffmpeg"], ffprobe=d["ffprobe"], tools=d["tools"], insert_tools=d["insert_tools"])
         if not d["ok"]:
             problems.append(d["detail"] or "ffmpeg-skill doctor reports a problem (ffmpeg, ffprobe or a needed tool)")
         engine["ok"] = not problems
@@ -158,6 +183,12 @@ def cmd_doctor(a: argparse.Namespace) -> int:
                     "ready": {"pdf": pdf["found"], "pptx_key_odp": pdf["found"] and office["found"]}}
     notes = [f"slide import: {name} not found; {d['install']}" for name, d in (("pypdfium2", pdf), ("LibreOffice", office))
              if not d["found"]]
+    # Inserting clips needs more ffmpeg-skill tools than detect / chapters / match; missing ones are a note too.
+    if skill is not None:
+        unusable = [t for t in INSERT_TOOLS if t not in skill.tools or (engine.get("insert_tools") or {}).get(t) != "yes"]
+        engine["insert_ready"] = not unusable
+        if unusable:
+            notes.append("insert: ffmpeg-skill tool(s) not usable: " + ", ".join(unusable))
     doc = {"ok": not problems, "skill": "slide-sync-skill", "version": __version__,
            "python": platform.python_version(), "engine": engine, "import": slide_import, "problems": problems, "notes": notes}
     human = "\n".join((["OK"] if not problems else [f"problem: {p}" for p in problems]) + [f"note: {n}" for n in notes])
@@ -226,6 +257,28 @@ def parser() -> argparse.ArgumentParser:
     m.add_argument("--overwrite", action="store_true")
     common(m)
     m.set_defaults(func=cmd_match)
+
+    ins = sub.add_parser("insert", help="splice clips (a demo video, a still) in at slide boundaries; chapters shift with them")
+    ins.add_argument("video")
+    ins.add_argument("--insert", action="append", required=True, metavar="N=CLIP",
+                     help="insert CLIP after slide N of the timeline (0: before slide 1); repeat for more. A video "
+                          "clip goes in as it is, an image (png/jpg/...) becomes a still clip of --still-duration")
+    ins.add_argument("--insert-title", action="append", default=[], metavar="TITLE",
+                     help="chapter title of the inserted clips, in --insert order (default: the clip's file name)")
+    ins.add_argument("--still-duration", type=float, default=DEFAULT_STILL_DURATION,
+                     help=f"seconds an inserted image stays on screen (default {DEFAULT_STILL_DURATION:g})")
+    ins.add_argument("--timeline", help="timeline JSON from `detect -o` (default: detect now)")
+    ins.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="for detect when there is no --timeline")
+    ins.add_argument("--min-dwell", type=float, default=DEFAULT_MIN_DWELL, help="for detect when there is no --timeline")
+    ins.add_argument("--titles", help="text file, one chapter title per slide of the recording, in order")
+    ins.add_argument("--prefix", default="Slide", help="title for slides without one: '<prefix> N' (default Slide)")
+    ins.add_argument("--min-chapter", type=float, default=0.0, help="merge segments shorter than this into the previous chapter")
+    ins.add_argument("--chapters-out", help="write the chapter text of the output (YouTube description format) here")
+    ins.add_argument("--timeline-out", help="write the shifted timeline of the output (provenance DERIVED) here")
+    ins.add_argument("-o", "--output", required=True, help="the new video: clips spliced in, chapters written")
+    ins.add_argument("--overwrite", action="store_true")
+    common(ins)
+    ins.set_defaults(func=cmd_insert)
 
     k = sub.add_parser("contract", help="machine-readable contract")
     k.add_argument("--json", action="store_true")
