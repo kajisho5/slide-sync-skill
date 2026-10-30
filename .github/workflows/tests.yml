@@ -19,12 +19,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e .
-      - run: python -m unittest -v tests/test_slide_sync.py
+      - run: pip install -e ".[pdf]"
+      - name: Unit tests, slide import included (not skipped)
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest -v tests/test_slide_sync.py 2>&1 | tee test.log
+          ! grep -q "skipped 'needs pypdfium2'" test.log
       - run: slide-sync contract --json
 
   integration:
-    # The real engine: ffmpeg-skill (read-only checkout) and ffmpeg from apt.
+    # The real engine: ffmpeg-skill (read-only checkout) and ffmpeg from apt; LibreOffice and a Japanese font for import.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -35,8 +40,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
-      - run: pip install -e .
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core libreoffice-impress fonts-ipafont-gothic
+      - run: pip install -e ".[pdf]"
       - name: Integration tests run (not skipped)
         env:
           FFMPEG_SKILL_DIR: ${{ github.workspace }}/ffmpeg-skill
@@ -44,6 +51,7 @@ jobs:
           set -o pipefail
           python -m unittest -v tests/test_slide_sync.py 2>&1 | tee test.log
           ! grep -q "skipped 'needs ffmpeg-skill and ffmpeg'" test.log
+          ! grep -q "skipped 'needs LibreOffice and pypdfium2'" test.log
       - name: doctor
         env:
           FFMPEG_SKILL_DIR: ${{ github.workspace }}/ffmpeg-skill
