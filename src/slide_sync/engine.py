@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 ENV_DIRS = ("SLIDE_SYNC_FFMPEG_SKILL_DIR", "FFMPEG_SKILL_DIR")
-REQUIRED_TOOLS = ("scenes", "metadata")
+REQUIRED_TOOLS = ("scenes", "metadata", "look")
 
 Runner = Callable[[List[str], float], Tuple[int, str, str]]
 
