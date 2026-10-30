@@ -5,6 +5,7 @@
   slide-sync chapters talk.mp4 --timeline timeline.json --chapters-out chapters.txt
   slide-sync chapters talk.mp4 --titles titles.txt --min-chapter 10 -o talk_chapters.mp4
   slide-sync import deck.pdf -o pages/ --json            # page PNGs + page text (pptx/key via LibreOffice)
+  slide-sync match talk.mp4 --deck pages/ --timeline timeline.json -o match.json   # which page is on screen when
   slide-sync contract --json
   slide-sync doctor --json
 
@@ -25,6 +26,7 @@ from .contract import ERRORS, contract
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, SlideSyncError, chapters, detect, read_titles, write_chapters
 from .deck import DEFAULT_DPI, MAX_DPI, MIN_DPI, import_deck, pdfium_status, soffice_status
 from .engine import REQUIRED_TOOLS, EngineError, FfmpegSkill, candidates, engine_doctor, locate
+from .match import DEFAULT_MIN_MARGIN, DEFAULT_MIN_SCORE, DEFAULT_SAMPLES, MAX_SAMPLES, match
 
 
 def _emit(doc: Dict[str, Any], as_json: bool, human: str = "") -> None:
@@ -73,16 +75,20 @@ def cmd_detect(a: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_chapters(a: argparse.Namespace) -> int:
-    skill = _engine(a.ffmpeg_skill)
+def _timeline(a: argparse.Namespace, skill: FfmpegSkill) -> Dict[str, Any]:
+    """--timeline when given, otherwise `detect` now with --threshold / --min-dwell."""
     if a.timeline:
         try:
             with open(a.timeline, encoding="utf-8") as fh:
-                tl = json.load(fh)
+                return json.load(fh)
         except (OSError, ValueError) as e:
             raise SlideSyncError("INVALID_TIMELINE", f"cannot read {a.timeline}: {e}")
-    else:
-        tl = detect(skill, a.video, threshold=a.threshold, min_dwell=a.min_dwell, timeout=a.timeout)
+    return detect(skill, a.video, threshold=a.threshold, min_dwell=a.min_dwell, timeout=a.timeout)
+
+
+def cmd_chapters(a: argparse.Namespace) -> int:
+    skill = _engine(a.ffmpeg_skill)
+    tl = _timeline(a, skill)
     ch = chapters(tl, titles=read_titles(a.titles), prefix=a.prefix, min_chapter=a.min_chapter)
     if a.chapters_out:
         if os.path.exists(a.chapters_out) and not a.overwrite:
@@ -103,6 +109,24 @@ def cmd_import(a: argparse.Namespace) -> int:
     lines = [f"{m['page_count']} page(s) at {m['renderer']['dpi']:g} dpi -> {out_dir}"]
     lines += [f"  {p['index']:>3}  {p['image']}  {p['width_px']}x{p['height_px']}  {p['chars']} chars" for p in m["pages"]]
     _emit(dict(m, ok=True, output_dir=out_dir), a.json, "\n".join(lines))
+    return 0
+
+
+def cmd_match(a: argparse.Namespace) -> int:
+    skill = _engine(a.ffmpeg_skill)
+    if a.output and os.path.exists(a.output) and not a.overwrite:  # before the slow part
+        raise SlideSyncError("INVALID_ARGUMENT", f"refusing to overwrite {a.output}: pass --overwrite")
+    tl = _timeline(a, skill)
+    m = match(skill, a.video, a.deck, tl, min_score=a.min_score, min_margin=a.min_margin, samples=a.samples,
+              timeout=a.timeout)
+    if a.output:
+        _write_json(a.output, m, a.overwrite)
+    lines = [f"{m['matched_count']} of {m['segment_count']} segment(s) matched to a page of {m['deck']['page_count']}"]
+    lines += [f"  {s['index']:>3}  {s['start']:>9.3f}  {s['end']:>9.3f}  "
+              + (f"page {s['page']:<4} {s['confidence']:.3f}" if s["page"] is not None else f"--        {s['reason']}")
+              for s in m["segments"]]
+    lines += [f"warning: {w}" for w in m["warnings"]]
+    _emit(dict(m, ok=True, match_file=a.output), a.json, "\n".join(lines))
     return 0
 
 
@@ -185,6 +209,23 @@ def parser() -> argparse.ArgumentParser:
     im.add_argument("--overwrite", action="store_true", help="replace page files and deck.json already in the directory")
     im.add_argument("--json", action="store_true", help="print one JSON document")
     im.set_defaults(func=cmd_import)
+
+    m = sub.add_parser("match", help="which deck page is on screen in each slide of the timeline")
+    m.add_argument("video")
+    m.add_argument("--deck", required=True, help="directory written by `slide-sync import` (deck.json and page PNGs)")
+    m.add_argument("--timeline", help="timeline JSON from `detect -o` (default: detect now)")
+    m.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="for detect when there is no --timeline")
+    m.add_argument("--min-dwell", type=float, default=DEFAULT_MIN_DWELL, help="for detect when there is no --timeline")
+    m.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
+                   help=f"lowest correlation that counts as a match, -1 to 1 (default {DEFAULT_MIN_SCORE:g})")
+    m.add_argument("--min-margin", type=float, default=DEFAULT_MIN_MARGIN,
+                   help=f"how far the best page must lead the runner-up (default {DEFAULT_MIN_MARGIN:g})")
+    m.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
+                   help=f"frames compared per slide, 1-{MAX_SAMPLES}; the median score counts (default {DEFAULT_SAMPLES})")
+    m.add_argument("-o", "--output", help="also write the match JSON here")
+    m.add_argument("--overwrite", action="store_true")
+    common(m)
+    m.set_defaults(func=cmd_match)
 
     k = sub.add_parser("contract", help="machine-readable contract")
     k.add_argument("--json", action="store_true")

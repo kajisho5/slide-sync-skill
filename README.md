@@ -16,7 +16,7 @@
 
 Slide changes in a talk recording, as a slide timeline and chapters. Part of the [AI Video Production OS](https://github.com/kajisho5/AI-video-production-OS) (department 認識 / Recognition).
 
-Typical use: a conference or lecture recording from the presenter's screen feed. `detect` finds where each slide starts. `chapters` turns that into the YouTube description's chapter list and, if you want, a copy of the video with chapters a player can seek by. `import` turns the speaker's deck (PDF, or PPTX / KEY through LibreOffice) into one image and one text per page.
+Typical use: a conference or lecture recording from the presenter's screen feed. `detect` finds where each slide starts. `chapters` turns that into the YouTube description's chapter list and, if you want, a copy of the video with chapters a player can seek by. `import` turns the speaker's deck (PDF, or PPTX / KEY through LibreOffice) into one image and one text per page. `match` says which page of that deck is on screen in each detected slide, in whatever order the speaker showed them.
 
 ```bash
 pip install -e .
@@ -28,6 +28,7 @@ slide-sync chapters talk.mp4 --timeline timeline.json --titles titles.txt --min-
 
 pip install -e '.[pdf]'                          # slide import (pypdfium2); PPTX / KEY also need LibreOffice
 slide-sync import deck.pdf -o pages/             # pages/page-001.png, page-001.txt, ..., deck.json
+slide-sync match talk.mp4 --deck pages/ --timeline timeline.json -o match.json
 ```
 
 `chapters.txt` (also in the JSON as `text`):
@@ -46,7 +47,9 @@ slide-sync import deck.pdf -o pages/             # pages/page-001.png, page-001.
 
 - **Import.** [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) (PDFium; Apache-2.0 OR BSD-3-Clause) renders every page of a PDF and reads its text layer. A `.pptx`, `.ppt`, `.key` or `.odp` deck is first converted to PDF by LibreOffice (`soffice --headless --convert-to pdf`, on a copy of the deck, with a throwaway profile); without LibreOffice that is a `DEPENDENCY_MISSING` error. Pages are rendered at a fixed **144 dpi** by default (`--dpi`, 18-600): a 16:9 PowerPoint slide (960 x 540 pt) becomes 1920 x 1080 px, in general `ceil(points x dpi / 72)`. Output is deterministic: 8-bit RGB PNG with no metadata, and the same text normalisation every time (line ends, Unicode NFC, Kangxi-radical look-alikes such as `⽇` folded to `日`). `deck.json` (`slide-sync/deck@1`) lists every page with its size, text and PNG sha256. Why these engines (PyMuPDF and Ghostscript are AGPL, Poppler is GPL): [docs/decisions.md](docs/decisions.md) ADR-001.
 
-This skill never runs ffmpeg or ffprobe itself: ffmpeg-skill is its only media boundary. `detect` and `chapters` need nothing beyond the Python standard library; `import` needs the optional `pdf` extra (and LibreOffice for non-PDF decks). Nothing makes network access.
+- **Match.** For each slide of the timeline, three frames (at 1/4, 1/2 and 3/4 of it) come from ffmpeg-skill `look`. Each frame and each page becomes a grid of mean brightness. A frame is compared as a whole (screen capture), with the page's aspect fitted (letterbox / pillarbox), and, when the slide sits inside a uniform surround (black bars, a dark room), as the quadrilateral found there, straightened (a camera's keystone, a small tilt). Brightness and contrast are normalised, the deck's average page is subtracted (so a shared template does not make every page look alike), and the score is the correlation, 0 to 1, median over the frames. A segment gets a page only when its score is at least **0.7** (`--min-score`) and at least **0.1** ahead of the next page (`--min-margin`); otherwise `page` is `null` with the reason (`below_min_score`, `ambiguous`). Frames of one slide that show different pages are flagged `mixed` (a change `detect` missed). Method, thresholds and what they were measured on: [docs/decisions.md](docs/decisions.md) ADR-002.
+
+This skill never runs ffmpeg or ffprobe itself: ffmpeg-skill is its only media boundary. `detect`, `chapters` and `match` need nothing beyond the Python standard library; `import` needs the optional `pdf` extra (and LibreOffice for non-PDF decks). Nothing makes network access.
 
 ## Commands
 
@@ -55,10 +58,11 @@ This skill never runs ffmpeg or ffprobe itself: ffmpeg-skill is its only media b
 | `detect <video> [--threshold 8] [--min-dwell 2] [--sheet png] [-o timeline.json]` | Slide timeline (`slide-sync/timeline@1`): slides with start, end and duration, change times, detector settings, engine version |
 | `chapters <video> [--timeline json] [--titles txt] [--prefix Slide] [--min-chapter s] [--chapters-out txt] [-o video]` | Chapters from a timeline. Without `--timeline` it runs `detect` first |
 | `import <deck> -o <dir> [--dpi 144] [--soffice path] [--overwrite]` | `<dir>/page-NNN.png`, `page-NNN.txt` and `deck.json` for a `.pdf`, or a `.pptx` / `.ppt` / `.key` / `.odp` when LibreOffice is installed. Only those names are written; existing ones need `--overwrite` |
+| `match <video> --deck <dir> [--timeline json] [--min-score 0.7] [--min-margin 0.1] [--samples 3] [-o match.json]` | Match timeline (`slide-sync/match@1`): for every slide, start, end, deck `page` (or `null` and the `reason`), `confidence`, `margin` over the runner-up, `method`, `view`, per-frame pages, top candidates; `pages_shown`, `pages_not_shown`, `warnings`. Without `--timeline` it runs `detect` first |
 | `contract --json` | Machine-readable contract in the OS registry's shape |
-| `doctor --json` | Python, ffmpeg-skill location and version, ffmpeg / ffprobe, and whether `scenes` / `metadata` are usable; for import, pypdfium2 and LibreOffice with their install lines (a missing one is a note, not a failure) |
+| `doctor --json` | Python, ffmpeg-skill location and version, ffmpeg / ffprobe, and whether `scenes` / `metadata` / `look` are usable; for import, pypdfium2 and LibreOffice with their install lines (a missing one is a note, not a failure) |
 
-Every command prints one JSON document with `--json`. Exit codes: 0 ok, 2 invalid input or arguments (including a file PDFium cannot open), 3 ffmpeg-skill, pypdfium2 or LibreOffice missing (or ffmpeg-skill lacking a tool), 4 ffmpeg-skill or LibreOffice failed.
+Every command prints one JSON document with `--json`. Exit codes: 0 ok, 2 invalid input or arguments (including a file PDFium cannot open, or a deck directory without `deck.json`), 3 ffmpeg-skill, pypdfium2 or LibreOffice missing (or ffmpeg-skill lacking a tool), 4 ffmpeg-skill or LibreOffice failed.
 
 ## Limits
 
@@ -67,7 +71,7 @@ Every command prints one JSON document with `--json`. Exit codes: 0 ok, 2 invali
 - Animated builds and videos inside a slide can count as changes.
 - `import` reads the text layer of the deck. A scanned or image-only page has no text layer and gets empty text; reading text from pixels (OCR) is detection-skill's job.
 - PPTX / KEY rendering is LibreOffice's: fonts the deck uses but the machine lacks are substituted, so check the PNGs (or export the PDF from PowerPoint / Keynote yourself).
-- Not yet: matching each detected change to a page of the deck (`ECOSYSTEM_ROADMAP.md`, step 4).
+- `match` compares pictures, not text. A slide that is not in the imported deck, a blanked projector, two identical pages, a person standing in front of the slide, or a camera zoomed into part of it give `page: null`, by design. Something that crosses the slide's edge or a surround that is not uniform (stage lights, heads at the bottom of the frame) defeats the straightening; then only a near-full-frame shot still matches. Details and measurements: ADR-002.
 
 ## Tests
 
@@ -75,7 +79,7 @@ Every command prints one JSON document with `--json`. Exit codes: 0 ok, 2 invali
 python -m unittest -v tests/test_slide_sync.py
 ```
 
-The integration tests run the real ffmpeg-skill on generated slide decks. They are skipped when ffmpeg-skill or ffmpeg is not found. The import tests build their PDF (English and Japanese pages) and PPTX at test time; they need `pip install -e '.[pdf]'`, and the real-LibreOffice test also needs `soffice`.
+The integration tests run the real ffmpeg-skill on generated slide decks. They are skipped when ffmpeg-skill or ffmpeg is not found. The import tests build their PDF (English and Japanese pages) and PPTX at test time; they need `pip install -e '.[pdf]'`, and the real-LibreOffice test also needs `soffice`. The match unit tests draw their pages and frames in Python. The shuffled-slides test imports a generated deck, films it with ffmpeg out of order (with a slide that is not in the deck and a blanked projector), as a screen capture and as a keystoned camera shot, and checks every segment's page; it needs ffmpeg-skill, ffmpeg and pypdfium2.
 
 ## License
 

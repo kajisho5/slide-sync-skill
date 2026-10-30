@@ -8,6 +8,8 @@ from . import __version__
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, TIMELINE_SCHEMA
 from .deck import DECK_SCHEMA, DEFAULT_DPI, ENV_SOFFICE, OFFICE_EXTS, TEXT_NORMALISATION
 from .engine import ENV_DIRS, REQUIRED_TOOLS
+from .match import (DEFAULT_MIN_MARGIN, DEFAULT_MIN_SCORE, DEFAULT_SAMPLES, FEAT_H, FEAT_W, FRAME_WIDTH, MATCH_SCHEMA,
+                    METHOD)
 
 SKILL_ID = "slide-sync"
 CONTRACT_VERSION = "1.0"
@@ -27,6 +29,13 @@ TOOLS = [
                     "pypdfium2 (optional extra 'pdf'); pptx / ppt / key / odp converted to PDF by LibreOffice when installed",
      "argv": ["import", "<deck.pdf|.pptx|.ppt|.key|.odp>", "-o <dir>", f"[--dpi {DEFAULT_DPI:g}]", "[--soffice <path>]",
               "[--overwrite]", "--json"]},
+    {"tool_id": "slide-sync/match", "role": "measurement", "writes_media": False, "mutates_input": False, "deterministic": True,
+     "description": "Which page of an imported deck is on screen in each slide of a timeline (slide-sync/match@1): page, "
+                    "confidence and margin per segment by image correlation of frames (ffmpeg-skill look) with the page "
+                    "images, or page null with the reason when no page is clearly best. Order need not follow the deck",
+     "argv": ["match", "<video>", "--deck <dir>", "[--timeline <timeline.json>]", f"[--min-score {DEFAULT_MIN_SCORE:g}]",
+              f"[--min-margin {DEFAULT_MIN_MARGIN:g}]", f"[--samples {DEFAULT_SAMPLES}]", "[-o <match.json>]", "[--overwrite]",
+              "--json"]},
 ]
 
 ERRORS = {
@@ -35,6 +44,7 @@ ERRORS = {
     "INVALID_TIMELINE": {"exit_code": 2, "retryable": False},
     "OUTPUT_IS_INPUT": {"exit_code": 2, "retryable": False},
     "INVALID_DECK": {"exit_code": 2, "retryable": False},
+    "INVALID_IMAGE": {"exit_code": 2, "retryable": False},
     "DEPENDENCY_MISSING": {"exit_code": 3, "retryable": False},
     "ENGINE_NOT_FOUND": {"exit_code": 3, "retryable": False},
     "ENGINE_TOOL_MISSING": {"exit_code": 3, "retryable": False},
@@ -54,7 +64,8 @@ def contract() -> Dict[str, Any]:
         "contract_version": CONTRACT_VERSION,
         "provides": [{"id": "slides.detect_changes", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/detect"},
                      {"id": "slides.chapters", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/chapters"},
-                     {"id": "slides.import", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/import"}],
+                     {"id": "slides.import", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/import"},
+                     {"id": "slides.match", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/match"}],
         "dependencies": [{"id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <3.0.0",
                           "tools": list(REQUIRED_TOOLS), "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
                           + ["~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
@@ -66,11 +77,14 @@ def contract() -> Dict[str, Any]:
                           "located_by": ["--soffice", f"${ENV_SOFFICE}", "PATH (soffice, libreoffice)",
                                          "/Applications/LibreOffice.app", "%ProgramFiles%\\LibreOffice"]}],
         "not_provided": ["slide text from images or scanned pages (OCR: detection-skill)",
-                         "matching a change to a slide of the deck (planned)",
+                         "matching by slide text (OCR of the frames is detection-skill's; match compares pictures)",
                          "running ffmpeg or ffprobe directly (only through ffmpeg-skill)",
                          "editing or re-encoding the picture", "network access of any kind"],
         "tools": TOOLS,
         "timeline": {"schema": TIMELINE_SCHEMA, "provenance": "OBSERVED"},
+        "match": {"schema": MATCH_SCHEMA, "provenance": "OBSERVED", "method": METHOD, "min_score": DEFAULT_MIN_SCORE,
+                  "min_margin": DEFAULT_MIN_MARGIN, "samples": DEFAULT_SAMPLES, "frame_width": FRAME_WIDTH,
+                  "feature": [FEAT_W, FEAT_H], "unmatched": "page null with reason below_min_score or ambiguous"},
         "deck": {"schema": DECK_SCHEMA, "provenance": "OBSERVED", "default_dpi": DEFAULT_DPI,
                  "text_normalisation": TEXT_NORMALISATION},
         "execution": {"canonical_invocation": ["slide-sync", "<command>", "...", "--json"], "network": False, "shell": False,

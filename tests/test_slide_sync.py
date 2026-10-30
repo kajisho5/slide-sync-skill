@@ -3,7 +3,9 @@
 Unit tests fake ffmpeg-skill's answers. Integration tests run the real ffmpeg-skill on generated slide decks;
 they are skipped unless ffmpeg-skill is found (FFMPEG_SKILL_DIR, ../ffmpeg-skill, ...) and ffmpeg is on PATH.
 Import tests build their PDF / PPTX decks here at test time; they need pypdfium2 (`pip install -e '.[pdf]'`), and the
-real-LibreOffice test also needs soffice.
+real-LibreOffice test also needs soffice. Match unit tests draw their pages and frames in Python; the shuffled-slides
+integration test imports a generated PDF, films it with ffmpeg in shuffled order (screen capture and keystoned camera)
+and needs ffmpeg-skill, ffmpeg and pypdfium2.
 
     python -m unittest -v tests/test_slide_sync.py
 """
@@ -34,6 +36,8 @@ from slide_sync.core import TIMELINE_SCHEMA, SlideSyncError, chapters, detect, t
 from slide_sync import deck as deck_mod  # noqa: E402
 from slide_sync.deck import DECK_SCHEMA, convert_to_pdf, find_soffice, import_deck, normalise_text  # noqa: E402
 from slide_sync.engine import EngineError, FfmpegSkill, locate, run_tool  # noqa: E402
+from slide_sync import match as match_mod  # noqa: E402
+from slide_sync.match import MATCH_SCHEMA, decide, match, quad_sampler, read_png, sample_times, slide_quad  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,7 +54,7 @@ class FakeRunner:
         return rc, out if isinstance(out, str) else json.dumps(out), err
 
 
-SKILL = FfmpegSkill("/fake/ffmpeg-skill", "2.21.0", ["metadata", "probe", "scenes"])
+SKILL = FfmpegSkill("/fake/ffmpeg-skill", "2.21.0", ["look", "metadata", "probe", "scenes"])
 
 
 def scenes_doc(bounds, duration):
@@ -172,6 +176,9 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(c["version"], __version__)
         self.assertEqual({p["tool_id"] for p in c["provides"]}, {t["tool_id"] for t in c["tools"]})
         self.assertIn("slides.import", {p["id"] for p in c["provides"]})
+        self.assertIn("slides.match", {p["id"] for p in c["provides"]})
+        self.assertIn("look", next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"])
+        self.assertEqual(c["match"]["schema"], MATCH_SCHEMA)
         optional = {d["id"]: d for d in c["dependencies"] if not d["required"]}
         self.assertEqual(set(optional), {"pypdfium2", "libreoffice"})
         self.assertNotIn("AGPL", json.dumps(c))
@@ -534,6 +541,265 @@ class ImportTests(unittest.TestCase):
         self.assertEqual((m["source"]["format"], m["source"]["converted_by"]["tool"]), ("pptx", "libreoffice"))
 
 
+# ------------------------------------------------------------------ match: pages and frames drawn here
+
+def draw(width, height, bg, rects):
+    """Raw RGB rows: a background and filled rectangles (x, y, w, h, rgb), the stand-in for slide text and shapes."""
+    rows = [bytearray(bytes(bg) * width) for _ in range(height)]
+    for x, y, w, h, rgb in rects:
+        for yy in range(max(0, y), min(height, y + h)):
+            rows[yy][3 * max(0, x):3 * min(width, x + w)] = bytes(rgb) * (min(width, x + w) - max(0, x))
+    return [bytes(r) for r in rows]
+
+
+def page_rects(i, width=320, height=180):
+    """A slide of one template: the same title bar on every page, then 'lines of text' whose count, lengths and
+    indents differ from page to page."""
+    rects = [(0, 0, width, 22, (40, 60, 120)), (16, 30, 60 + 23 * (i % 5), 10, (20, 20, 20))]
+    for k in range(2 + i % 4):
+        length = 40 + (i * 37 + k * 53) % 200
+        rects.append((24 + 12 * ((i + k) % 3), 58 + 24 * k, length, 7, (30, 30, 30)))
+    if i % 3 == 0:
+        rects.append((220, 120, 70, 45, (200, 80, 40)))  # a figure
+    return rects
+
+
+def write_png(path, width, height, rows):
+    Path(path).write_bytes(deck_mod.png_bytes(width, height, b"".join(rows), width * 3, 3))
+
+
+def write_deck(directory, pages, size=(320, 180)):
+    """A deck directory as `import` writes it (deck.json + page PNGs), from `pages`: list of rect lists."""
+    os.makedirs(directory, exist_ok=True)
+    out = []
+    for n, rects in enumerate(pages, 1):
+        name = f"page-{n:03d}.png"
+        write_png(os.path.join(directory, name), size[0], size[1], draw(size[0], size[1], (255, 255, 255), rects))
+        out.append({"index": n, "image": name, "text_file": f"page-{n:03d}.txt", "width_px": size[0], "height_px": size[1]})
+    Path(directory, "deck.json").write_text(json.dumps({"schema": DECK_SCHEMA, "source": {"path": "deck.pdf"},
+                                                        "page_count": len(out), "pages": out}), encoding="utf-8")
+
+
+def frame_rows(page_rows, pw, ph, fw, fh, box=None, surround=(16, 16, 16)):
+    """A video frame: the page scaled (nearest) into `box` (x, y, w, h) of an fw x fh frame of `surround`, or filling it."""
+    x0, y0, bw, bh = box or (0, 0, fw, fh)
+    out = []
+    for y in range(fh):
+        if not y0 <= y < y0 + bh:
+            out.append(bytes(surround) * fw)
+            continue
+        src = page_rows[(y - y0) * ph // bh]
+        row = bytearray(bytes(surround) * fw)
+        for x in range(x0, x0 + bw):
+            sx = (x - x0) * pw // bw
+            row[3 * x:3 * x + 3] = src[3 * sx:3 * sx + 3]
+        out.append(bytes(row))
+    return out
+
+
+class LookRunner:
+    """Stands in for ffmpeg-skill look: writes, for every --at, the frame the script says is on screen then."""
+
+    def __init__(self, script, frames):
+        self.script = script  # [(start, end, key)]
+        self.frames = frames  # key -> (width, height, rows)
+        self.calls = []
+
+    def __call__(self, argv, timeout):
+        self.calls.append(argv)
+        assert Path(argv[1]).name == "look.py"
+        base = argv[argv.index("-o") + 1]
+        outputs = []
+        for i, a in enumerate(argv):
+            if a == "--at":
+                t = float(argv[i + 1])
+                key = next(k for s, e, k in self.script if s <= t < e)
+                w, h, rows = self.frames[key]
+                out = f"{base}_{t:.3f}s.png"
+                write_png(out, w, h, rows)
+                outputs.append(out)
+        return 0, json.dumps({"status": "completed", "output": None, "outputs": outputs}), ""
+
+
+def match_timeline(video, script, duration):
+    return {"schema": TIMELINE_SCHEMA, "source": {"path": os.path.abspath(video), "duration": duration},
+            "slides": [{"index": n, "start": s, "end": e, "duration": e - s} for n, (s, e, _) in enumerate(script, 1)]}
+
+
+class MatchUnitTests(unittest.TestCase):
+    """The matcher on pictures drawn here, with ffmpeg-skill look faked: no ffmpeg, no PDF engine."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.video = os.path.join(cls.tmp, "talk.mp4")
+        Path(cls.video).write_bytes(b"x")
+        cls.pages = [page_rects(i) for i in range(1, 9)]
+        cls.deck = os.path.join(cls.tmp, "deck")
+        write_deck(cls.deck, cls.pages)
+        cls.page_rows = {n: draw(320, 180, (255, 255, 255), r) for n, r in enumerate(cls.pages, 1)}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def frame(self, key, **kw):
+        if key == "black":
+            return 640, 360, [bytes(640 * 3)] * 360
+        rows = self.page_rows.get(key) or draw(320, 180, (255, 255, 255), page_rects(key))  # key 11: not in the deck
+        return 640, 360, frame_rows(rows, 320, 180, 640, 360, **kw)
+
+    def test_shuffled_screen_and_letterboxed_segments(self):
+        # back and forth, skips, a page shown letterboxed, a slide that is not in the deck, the projector blanked
+        shown = [(1, {}), (2, {}), (5, {}), (3, {"box": (80, 45, 480, 270)}), (2, {}), (11, {}), (8, {}), ("black", {}),
+                 (5, {"box": (40, 22, 560, 315)}), (6, {})]
+        script = [(4.0 * n, 4.0 * (n + 1), n) for n in range(len(shown))]
+        frames = {n: self.frame(key, **kw) for n, (key, kw) in enumerate(shown)}
+        runner = LookRunner(script, frames)
+        m = match(SKILL, self.video, self.deck, match_timeline(self.video, script, 40.0), samples=1, runner=runner)
+        self.assertEqual(m["schema"], MATCH_SCHEMA)
+        self.assertEqual([s["page"] for s in m["segments"]], [1, 2, 5, 3, 2, None, 8, None, 5, 6])
+        self.assertEqual([s["reason"] for s in m["segments"]][5:8], ["below_min_score", None, "below_min_score"])
+        self.assertEqual(m["segments"][3]["view"], "located")
+        self.assertEqual(m["segments"][0]["view"], "full")
+        for s in m["segments"]:
+            self.assertEqual(s["method"], "luma-grid-zncc")
+            if s["page"] is not None:
+                self.assertGreaterEqual(s["confidence"], match_mod.DEFAULT_MIN_SCORE)
+                self.assertGreaterEqual(s["margin"], match_mod.DEFAULT_MIN_MARGIN)
+        self.assertEqual((m["matched_count"], m["pages_shown"], m["pages_not_shown"]), (8, [1, 2, 3, 5, 6, 8], [4, 7]))
+        argv = runner.calls[0]
+        self.assertEqual(len(runner.calls), 1)  # one look call for every frame
+        self.assertEqual(argv[argv.index("--width") + 1], str(match_mod.FRAME_WIDTH))
+        self.assertIn("--no-timecode", argv)
+        self.assertEqual(argv[-1], "--json")
+
+    def test_identical_pages_are_ambiguous_not_guessed(self):
+        deck = os.path.join(self.tmp, "dup")
+        write_deck(deck, [self.pages[0], self.pages[1], self.pages[2], self.pages[1]])  # page 4 repeats page 2
+        script = [(0.0, 5.0, 0), (5.0, 10.0, 1)]
+        runner = LookRunner(script, {0: self.frame(1), 1: self.frame(2)})
+        m = match(SKILL, self.video, deck, match_timeline(self.video, script, 10.0), samples=1, runner=runner)
+        first, second = m["segments"]
+        self.assertEqual(first["page"], 1)
+        self.assertEqual((second["page"], second["reason"], second["margin"]), (None, "ambiguous", 0.0))
+        self.assertEqual({c["page"] for c in second["candidates"][:2]}, {2, 4})
+
+    def test_frames_that_disagree_are_reported(self):
+        # detect missed the change at 6 s: one segment holds page 4 then page 7
+        script = [(0.0, 6.0, "a"), (6.0, 12.0, "b")]
+        runner = LookRunner(script, {"a": self.frame(4), "b": self.frame(7)})
+        tl = match_timeline(self.video, [(0.0, 12.0, None)], 12.0)
+        m = match(SKILL, self.video, self.deck, tl, samples=3, runner=runner)
+        seg = m["segments"][0]
+        self.assertEqual([s["page"] for s in seg["samples"]], [4, 7, 7])
+        self.assertTrue(seg["mixed"])
+        self.assertEqual(seg["page"], 7)  # the median: two of three frames
+        self.assertTrue(any("detect may have missed a change" in w for w in m["warnings"]))
+
+    def test_thresholds_decide(self):
+        self.assertEqual(decide({1: 0.9, 2: 0.5}, min_score=0.7, min_margin=0.1)["page"], 1)
+        self.assertEqual(decide({1: 0.65, 2: 0.1}, min_score=0.7, min_margin=0.1)["reason"], "below_min_score")
+        self.assertEqual(decide({1: 0.9, 2: 0.85}, min_score=0.7, min_margin=0.1)["reason"], "ambiguous")
+        d = decide({3: 0.8}, min_score=0.7, min_margin=0.1)  # a one-page deck: no runner-up
+        self.assertEqual((d["page"], d["candidates"]), (3, [{"page": 3, "score": 0.8}]))
+
+    def test_sample_times_stay_inside_the_segment_and_the_video(self):
+        self.assertEqual(sample_times(10.0, 14.0, 3), [11.05, 12.0, 12.95])
+        self.assertEqual(sample_times(10.0, 10.1, 2), [10.05, 10.05])
+        self.assertTrue(all(t <= 19.9 for t in sample_times(18.0, 25.0, 3, duration=20.0)))
+
+    def test_keystoned_slide_is_found_as_a_quadrilateral(self):
+        gw, gh = 256, 144
+        quad = ((40.3, 20.6), (214.2, 12.4), (222.7, 128.1), (31.5, 133.2))
+
+        def inside(x, y):  # convex quad, corners clockwise in image coordinates
+            sign = []
+            for (ax, ay), (bx, by) in zip(quad, quad[1:] + quad[:1]):
+                sign.append((bx - ax) * (y - ay) - (by - ay) * (x - ax) >= 0)
+            return all(sign)
+        luma = []
+        for j in range(gh):
+            for i in range(gw):  # 4 x 4 supersampling: a cell on the edge gets its covered fraction
+                cover = sum(inside(i + (a + 0.5) / 4, j + (b + 0.5) / 4) for a in range(4) for b in range(4)) / 16
+                luma.append(30 + 200 * cover)
+        found = slide_quad(luma, gw, gh)
+        self.assertIsNotNone(found)
+        for (fx, fy), (qx, qy) in zip(found, quad):
+            self.assertLess(abs(fx - qx), 0.5)
+            self.assertLess(abs(fy - qy), 0.5)
+        to_xy = quad_sampler(quad)
+        for (u, v), (qx, qy) in zip(((0, 0), (1, 0), (1, 1), (0, 1)), quad):
+            x, y = to_xy(u, v)
+            self.assertAlmostEqual(x, qx, places=6)
+            self.assertAlmostEqual(y, qy, places=6)
+        self.assertIsNone(slide_quad([100.0 + (i * 7919 % 97) for i in range(gw * gh)], gw, gh))  # no surround
+
+    def test_png_reader_undoes_every_filter_and_format(self):
+        width, height = 7, 5
+        pixels = [bytes((x * 37 + y * 11 + c * 50) % 256 for x in range(width) for c in range(3)) for y in range(height)]
+
+        def paeth(a, b, c):
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            return a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+
+        def encode(rows, bpp, colour, depth=8, plte=b""):
+            raw, prev = b"", bytes(len(rows[0]))
+            for y, row in enumerate(rows):
+                f = y % 5
+                line = bytearray()
+                for i, v in enumerate(row):
+                    a = row[i - bpp] if i >= bpp else 0
+                    b, c = prev[i], prev[i - bpp] if i >= bpp else 0
+                    pred = (0, a, b, (a + b) // 2, paeth(a, b, c))[f]
+                    line.append((v - pred) & 0xFF)
+                raw += bytes([f]) + bytes(line)
+                prev = row
+            w = len(rows[0]) // bpp
+
+            def chunk(kind, data):
+                return len(data).to_bytes(4, "big") + kind + data + (zlib.crc32(kind + data) & 0xFFFFFFFF).to_bytes(4, "big")
+            ihdr = w.to_bytes(4, "big") + len(rows).to_bytes(4, "big") + bytes([depth, colour, 0, 0, 0])
+            return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + (chunk(b"PLTE", plte) if plte else b"")
+                    + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "a.png")
+            Path(p).write_bytes(encode(pixels, 3, 2))
+            self.assertEqual(read_png(p), (width, height, 3, pixels))
+            rgba = [bytes(v for x in range(width) for v in row[3 * x:3 * x + 3] + b"\x80") for row in pixels]
+            Path(p).write_bytes(encode(rgba, 4, 6))
+            self.assertEqual(read_png(p), (width, height, 4, rgba))
+            grey16 = [bytes(v for x in range(width) for v in (row[3 * x], 0x55)) for row in pixels]
+            Path(p).write_bytes(encode(grey16, 2, 0, depth=16))
+            self.assertEqual(read_png(p), (width, height, 1, [row[0::3] for row in pixels]))
+            palette = bytes(range(0, 255, 85)) * 3  # 4 colours
+            Path(p).write_bytes(encode([bytes([x % 4 for x in range(width)])] * 2, 1, 3, plte=palette[:12]))
+            self.assertEqual(read_png(p)[3][0][:6], palette[0:3] + palette[3:6])
+            Path(p).write_bytes(b"not a png")
+            with self.assertRaises(SlideSyncError) as e:
+                read_png(p)
+            self.assertEqual(e.exception.code, "INVALID_IMAGE")
+
+    def test_cli_errors(self):
+        def run(*argv):
+            buf = io.StringIO()
+            with redirect_stdout(buf), mock.patch.object(cli, "_engine", return_value=SKILL):
+                rc = cli.main(list(argv) + ["--json"])
+            return rc, json.loads(buf.getvalue())
+        tl = os.path.join(self.tmp, "tl.json")
+        Path(tl).write_text(json.dumps(match_timeline(self.video, [(0.0, 4.0, 0)], 4.0)), encoding="utf-8")
+        rc, doc = run("match", self.video, "--deck", os.path.join(self.tmp, "nowhere"), "--timeline", tl)
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_DECK"))
+        rc, doc = run("match", self.video, "--deck", self.deck, "--timeline", tl, "--samples", "0")
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_ARGUMENT"))
+        rc, doc = run("match", self.video, "--deck", self.deck, "--timeline", tl, "-o", tl)
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_ARGUMENT"))  # refuses to overwrite without --overwrite
+        Path(self.tmp, "bad.json").write_text(json.dumps({"schema": "x"}), encoding="utf-8")
+        rc, doc = run("match", self.video, "--deck", self.deck, "--timeline", os.path.join(self.tmp, "bad.json"))
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_TIMELINE"))
+
+
 SOFFICE = find_soffice()
 
 
@@ -613,6 +879,103 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(got, [(0, "はじめに"), (12, "方法"), (24, "結果")])
         with redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["chapters", video, "-o", out, "--json", "--ffmpeg-skill", ENGINE.root]), 4)
+
+
+def _latin(*lines):
+    return [("latin", t) for t in lines]
+
+
+# The shuffled-slides deck: one template (black text on a coloured page), distinct titles and bullets.
+SHUFFLE_DECK = [
+    ((255, 255, 255), _latin("Slide Sync", "Matching talk recordings to decks", "A. Author")),
+    ((120, 170, 255), _latin("Background", "- conference talks are recorded", "- slides are shared as PDF", "- chapters need pages")),
+    ((255, 190, 90), _latin("Method", "- frames from ffmpeg-skill", "- luma grid per picture", "- correlation with every page",
+                            "- median over frames")),
+    ((60, 190, 90), _latin("Results", "- every segment matched", "- unknown slides left null")),
+    ((240, 120, 160), _latin("Discussion", "- keystone from a camera", "- people in front", "- animated builds",
+                             "- videos in slides", "- zoomed shots")),
+    ((170, 170, 170), _latin("Thank you", "questions welcome")),
+]
+SHUFFLE_EXTRA = ((255, 255, 255), _latin("Appendix", "- not in the shared deck", "- extra backup slide"))
+# What the presenter shows, (page, seconds): back and forth, skipping, a backup slide that is not in the deck ("x") and
+# the projector blanked ("b"). The pages expected for each detected segment, None where no page may be claimed.
+SHUFFLE_SHOW = [(1, 4), (2, 4), (4, 4), (3, 4), (2, 3), ("x", 4), (5, 4), ("b", 3), (3, 3), (6, 4)]
+SHUFFLE_PAGES = [p if isinstance(p, int) else None for p, _ in SHUFFLE_SHOW]
+
+
+@unittest.skipUnless(ENGINE and shutil.which("ffmpeg") and HAS_PDFIUM, "needs ffmpeg-skill, ffmpeg and pypdfium2")
+class ShuffledSlidesTests(unittest.TestCase):
+    """Roadmap step 4's done-when fixture: a deck imported for real, shown out of order in a recording made here with
+    ffmpeg (the fixture runs ffmpeg directly; the skill never does), detected and matched by the real ffmpeg-skill."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        t = cls.tmp
+        Path(t, "deck.pdf").write_bytes(build_pdf(SHUFFLE_DECK))
+        Path(t, "extra.pdf").write_bytes(build_pdf([SHUFFLE_EXTRA]))
+        import_deck(os.path.join(t, "deck.pdf"), os.path.join(t, "pages"), dpi=72)
+        import_deck(os.path.join(t, "extra.pdf"), os.path.join(t, "extra"), dpi=72)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=960x540", "-frames:v", "1",
+                        os.path.join(t, "black.png")], check=True)
+
+        def image(p):
+            if isinstance(p, int):
+                return os.path.join(t, "pages", f"page-{p:03d}.png")
+            return os.path.join(t, "extra", "page-001.png") if p == "x" else os.path.join(t, "black.png")
+        lst = os.path.join(t, "show.txt")
+        with open(lst, "w", encoding="utf-8") as fh:
+            for p, seconds in SHUFFLE_SHOW:
+                fh.write(f"file '{image(p)}'\nduration {seconds}\n")
+            fh.write(f"file '{image(SHUFFLE_SHOW[-1][0])}'\n")
+        # a screen capture, and a camera off the projector's axis: slide in a dark room, keystoned, with sensor noise
+        looks = {"screen": "scale=1280:720",
+                 "camera": "scale=1000:562,pad=1280:720:140:79:0x202020,perspective=x0=60:y0=40:x1=1230:y1=0:x2=0:y2=720"
+                           ":x3=1280:y3=670:sense=destination,noise=alls=12:allf=t"}
+        cls.videos = {}
+        for name, vf in looks.items():
+            out = os.path.join(t, f"talk_{name}.mp4")
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-vf",
+                            vf + ",fps=25,format=yuv420p", "-c:v", "libx264", "-crf", "26", out], check=True)
+            cls.videos[name] = out
+        cls.timeline = detect(ENGINE, cls.videos["screen"])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def test_detect_finds_every_change(self):
+        starts = [0.0]
+        for _, seconds in SHUFFLE_SHOW[:-1]:
+            starts.append(starts[-1] + seconds)
+        self.assertEqual(self.timeline["slide_count"], len(SHUFFLE_SHOW))
+        for got, want in zip(self.timeline["changes"], starts[1:]):
+            self.assertAlmostEqual(got, want, delta=0.04 + 1e-6)
+
+    def test_screen_capture_maps_every_segment_to_its_page(self):
+        out = os.path.join(self.tmp, "match.json")
+        tl = os.path.join(self.tmp, "timeline.json")
+        Path(tl).write_text(json.dumps(self.timeline), encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["match", self.videos["screen"], "--deck", os.path.join(self.tmp, "pages"), "--timeline", tl,
+                           "-o", out, "--json", "--ffmpeg-skill", ENGINE.root])
+        doc = json.loads(buf.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["schema"]), (0, True, MATCH_SCHEMA))
+        self.assertEqual([s["page"] for s in doc["segments"]], SHUFFLE_PAGES)
+        self.assertEqual(json.loads(Path(out).read_text(encoding="utf-8")),
+                         {k: v for k, v in doc.items() if k not in ("ok", "match_file")})
+        for s in doc["segments"]:
+            self.assertEqual(s["reason"] is None, s["page"] is not None)
+            self.assertFalse(s["mixed"])
+        self.assertEqual(doc["pages_not_shown"], [])
+        self.assertEqual(doc["warnings"], ["2 segment(s) not matched to a page: 6, 8"])
+
+    def test_keystoned_camera_shot_maps_every_segment_to_its_page(self):
+        m = match(ENGINE, self.videos["camera"], os.path.join(self.tmp, "pages"), self.timeline)
+        self.assertEqual([s["page"] for s in m["segments"]], SHUFFLE_PAGES)
+        self.assertTrue(all(s["view"] == "located" for s in m["segments"] if s["page"] is not None))
+        self.assertTrue(any("measured on" in w for w in m["warnings"]))  # the timeline came from the screen recording
 
 
 if __name__ == "__main__":
