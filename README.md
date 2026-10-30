@@ -1,4 +1,18 @@
-# slide-sync-skill
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/app-icon-dark.png">
+    <img src="brand/app-icon.png" width="128" alt="slide-sync-skill app icon">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/logo/slide-sync-skill-wordmark-white.svg">
+    <img src="brand/logo/slide-sync-skill-wordmark-black.svg" height="48" alt="slide-sync-skill">
+  </picture>
+</p>
+
+<p align="center"><b>Slide changes in a talk, as a timeline and chapters</b></p>
 
 Slide changes in a talk recording, as a slide timeline and chapters. Part of the [AI Video Production OS](https://github.com/kajisho5/AI-video-production-OS) (department 認識 / Recognition).
 
