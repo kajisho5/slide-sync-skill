@@ -6,7 +6,7 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 ## Where it stands
 
 0.1.0: `detect` (slide timeline from ffmpeg-skill scenes, min-dwell filter, contact sheet) and `chapters` (chapter text, container chapters through ffmpeg-skill metadata), with contract and doctor. Stdlib only; unit tests plus integration tests on the real engine.
-Since then: `import` (deck -> per-page PNG + text; pypdfium2 as the optional `pdf` extra, LibreOffice for PPTX / KEY; ADR-001 in `docs/decisions.md`) and `match` (each detected slide -> deck page, confidence, or null; image correlation with a located, de-keystoned slide, standard library; ADR-002).
+Since then: `import` (deck -> per-page PNG + text; pypdfium2 as the optional `pdf` extra, LibreOffice for PPTX / KEY; ADR-001 in `docs/decisions.md`) and `match` (each detected slide -> deck page, confidence, or null; image correlation with a located, de-keystoned slide, standard library; ADR-002) and `insert` (clips spliced in at slide boundaries through ffmpeg-skill cut / insert / join, the timeline and chapters shifted by the clips' measured lengths, provenance DERIVED; ADR-003).
 
 ## What this repository owns
 
@@ -19,7 +19,7 @@ Since then: `import` (deck -> per-page PNG + text; pypdfium2 as the optional `pd
 
 ## Wiring
 
-ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters) and `look` (frames for match). Import uses pypdfium2 (optional extra `pdf`) and, for non-PDF decks, a system LibreOffice; neither goes through ffmpeg-skill. No agent adapter yet (step 6).
+ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` (frames for match), and `probe` / `cut` / `insert` / `join` (insert clips). Import uses pypdfium2 (optional extra `pdf`) and, for non-PDF decks, a system LibreOffice; neither goes through ffmpeg-skill. No agent adapter yet (step 6).
 
 ## Steps
 
@@ -31,7 +31,7 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters) and `loo
   - Done when: synthetic slideshow, +/-1 frame
 - [x] **4. MATCH op** — changes -> slide index ([#5](https://github.com/kajisho5/slide-sync-skill/pull/5), `match`; ADR-002)
   - Done when: shuffled-slides fixture
-- [ ] **5. Chapters / insert clips** — via ffmpeg-skill metadata and insert (chapters done in 0.1.0; insert clips remains)
+- [x] **5. Chapters / insert clips** — via ffmpeg-skill metadata and insert (chapters in 0.1.0; insert clips in [#6](https://github.com/kajisho5/slide-sync-skill/pull/6), `insert`; ADR-003)
   - Done when: chapters in the output
 - [ ] **6. SKILL.md, CI; (agent side) adapter** (SKILL.md and CI done in 0.1.0; the agent adapter remains)
 

@@ -5,12 +5,14 @@ they are skipped unless ffmpeg-skill is found (FFMPEG_SKILL_DIR, ../ffmpeg-skill
 Import tests build their PDF / PPTX decks here at test time; they need pypdfium2 (`pip install -e '.[pdf]'`), and the
 real-LibreOffice test also needs soffice. Match unit tests draw their pages and frames in Python; the shuffled-slides
 integration test imports a generated PDF, films it with ffmpeg in shuffled order (screen capture and keystoned camera)
-and needs ffmpeg-skill, ffmpeg and pypdfium2.
+and needs ffmpeg-skill, ffmpeg and pypdfium2. Insert unit tests shift timelines and fake ffmpeg-skill; the insert
+integration test splices generated clips into a generated talk with the real ffmpeg-skill.
 
     python -m unittest -v tests/test_slide_sync.py
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -35,7 +37,8 @@ from slide_sync.contract import ERRORS, contract  # noqa: E402
 from slide_sync.core import TIMELINE_SCHEMA, SlideSyncError, chapters, detect, timecode, write_chapters  # noqa: E402
 from slide_sync import deck as deck_mod  # noqa: E402
 from slide_sync.deck import DECK_SCHEMA, convert_to_pdf, find_soffice, import_deck, normalise_text  # noqa: E402
-from slide_sync.engine import EngineError, FfmpegSkill, locate, run_tool  # noqa: E402
+from slide_sync.engine import INSERT_TOOLS, EngineError, FfmpegSkill, locate, run_tool  # noqa: E402
+from slide_sync.insert import insert_clips, parse_insert, segment_titles, shift_timeline  # noqa: E402
 from slide_sync import match as match_mod  # noqa: E402
 from slide_sync.match import MATCH_SCHEMA, decide, match, quad_sampler, read_png, sample_times, slide_quad  # noqa: E402
 
@@ -168,6 +171,219 @@ class ChapterTests(unittest.TestCase):
             self.assertTrue(out["output"].endswith("b.mp4"))
 
 
+class ShiftTimelineTests(unittest.TestCase):
+    """Timeline shifting for `insert`: pure arithmetic on a timeline, no engine."""
+
+    def tl(self, durations=(30, 40, 50)):
+        t = timeline(list(durations))
+        t.update(source={"path": "/rec/talk.mp4", "duration": float(sum(durations))}, provenance="OBSERVED",
+                 detector={"engine": "ffmpeg-skill/scenes"})
+        return t
+
+    def test_later_slides_shift_by_the_inserted_duration(self):
+        d = shift_timeline(self.tl(), [{"after_slide": 1, "duration": 12.5, "clip": "/clips/demo.mp4"}], output="/out/x.mp4")
+        got = [(s["index"], s["kind"], s.get("source_slide"), s["start"], s["end"], s["duration"]) for s in d["slides"]]
+        self.assertEqual(got, [(1, "slide", 1, 0.0, 30.0, 30.0), (2, "insert", None, 30.0, 42.5, 12.5),
+                               (3, "slide", 2, 42.5, 82.5, 40.0), (4, "slide", 3, 82.5, 132.5, 50.0)])
+        self.assertEqual(d["changes"], [30.0, 42.5, 82.5])
+        self.assertEqual((d["slide_count"], d["inserted_count"]), (4, 1))
+        self.assertEqual(d["source"], {"path": os.path.abspath("/out/x.mp4"), "duration": 132.5})
+        self.assertEqual(d["slides"][1]["title"], "demo")  # the clip's file name when no title is given
+
+    def test_provenance_records_every_edit(self):
+        d = shift_timeline(self.tl(), [{"after_slide": 2, "duration": 5, "clip": "/c/a.png", "kind": "still",
+                                        "sha256": "ab" * 32, "title": "Card"}])
+        self.assertEqual(d["provenance"], "DERIVED")
+        self.assertEqual(d["derived_from"], {"path": "/rec/talk.mp4", "duration": 120.0, "provenance": "OBSERVED", "slide_count": 3})
+        self.assertEqual(d["detector"], {"engine": "ffmpeg-skill/scenes"})
+        self.assertEqual(d["edits"], [{"op": "insert", "insert": 1, "after_slide": 2, "at_source": 70.0, "at_output": 70.0,
+                                       "duration": 5.0, "shift_after": 5.0, "title": "Card",
+                                       "clip": os.path.abspath("/c/a.png"), "clip_kind": "still", "clip_sha256": "ab" * 32}])
+
+    def test_several_inserts_at_the_start_the_end_and_one_boundary(self):
+        ins = [{"after_slide": 3, "duration": 4, "title": "End"}, {"after_slide": 1, "duration": 2, "title": "A"},
+               {"after_slide": 0, "duration": 3, "title": "Intro"}, {"after_slide": 1, "duration": 1, "title": "B"}]
+        d = shift_timeline(self.tl(), ins)
+        self.assertEqual([(s.get("title") or s["source_slide"], s["start"], s["end"]) for s in d["slides"]],
+                         [("Intro", 0.0, 3.0), (1, 3.0, 33.0), ("A", 33.0, 35.0), ("B", 35.0, 36.0), (2, 36.0, 76.0),
+                          (3, 76.0, 126.0), ("End", 126.0, 130.0)])
+        self.assertEqual([e["insert"] for e in d["edits"]], [3, 2, 4, 1])  # placed in timeline order, given order kept
+        self.assertEqual(d["source"]["duration"], 130.0)
+
+    def test_shifting_a_shifted_timeline_keeps_the_source_slides(self):
+        once = shift_timeline(self.tl(), [{"after_slide": 1, "duration": 10, "title": "Demo"}])
+        twice = shift_timeline(once, [{"after_slide": 3, "duration": 5, "title": "Card"}])
+        self.assertEqual([(s["kind"], s.get("source_slide"), s["start"]) for s in twice["slides"]],
+                         [("slide", 1, 0.0), ("insert", None, 30.0), ("slide", 2, 40.0), ("insert", None, 80.0),
+                          ("slide", 3, 85.0)])
+        self.assertEqual([e["title"] for e in twice["edits"]], ["Demo", "Card"])
+
+    def test_chapters_follow_the_shift_and_keep_slide_titles(self):
+        d = shift_timeline(self.tl(), [{"after_slide": 2, "duration": 15, "title": "デモ"}])
+        names = segment_titles(d, ["はじめに", "方法"], prefix="Slide")
+        self.assertEqual(names, ["はじめに", "方法", "デモ", "Slide 3"])
+        ch = chapters(d, titles=names)
+        self.assertEqual(ch["text"], "0:00 はじめに\n0:30 方法\n1:10 デモ\n1:25 Slide 3\n")
+        self.assertEqual(ch["warnings"], [])
+        merged = chapters(shift_timeline(self.tl(), [{"after_slide": 2, "duration": 4, "title": "x"}]), min_chapter=10)
+        self.assertEqual([(c["start"], c["end"]) for c in merged["chapters"]], [(0.0, 30.0), (30.0, 74.0), (74.0, 124.0)])
+
+    def test_bad_inserts(self):
+        for ins, code in (([{"after_slide": 4, "duration": 1}], "INVALID_ARGUMENT"),
+                          ([{"after_slide": -1, "duration": 1}], "INVALID_ARGUMENT"),
+                          ([{"after_slide": 1, "duration": 0}], "INVALID_ARGUMENT"),
+                          ([{"after_slide": True, "duration": 1}], "INVALID_ARGUMENT")):
+            with self.assertRaises(SlideSyncError) as e:
+                shift_timeline(self.tl(), ins)
+            self.assertEqual(e.exception.code, code)
+        with self.assertRaises(SlideSyncError) as e:
+            shift_timeline({"schema": "x"}, [])
+        self.assertEqual(e.exception.code, "INVALID_TIMELINE")
+
+    def test_parse_insert(self):
+        self.assertEqual(parse_insert("3=demo.mp4"), (3, "demo.mp4"))
+        self.assertEqual(parse_insert("0=C:\\clips\\a=b.mp4"), (0, "C:\\clips\\a=b.mp4"))
+        for bad in ("demo.mp4", "x=demo.mp4", "-1=a.mp4", "2="):
+            with self.assertRaises(SlideSyncError):
+                parse_insert(bad)
+
+
+class InsertRunner:
+    """Fake ffmpeg-skill for `insert`: answers probe / insert / cut / join / metadata and records every call."""
+
+    def __init__(self, durations, video=(1920, 1080, 30.0), join_duration=None):
+        self.durations = durations  # basename -> seconds
+        self.video = video
+        self.join_duration = join_duration
+        self.calls = []
+        self.chapters = None
+
+    def probe(self, path, duration):
+        w, h, fps = self.video
+        return {"file": path, "duration": duration, "video": {"width": w, "height": h, "fps": fps}}
+
+    def __call__(self, argv, timeout):
+        tool, args = Path(argv[1]).stem, argv[2:]
+        self.calls.append((tool, args))
+        out = args[args.index("-o") + 1] if "-o" in args else None
+        if tool == "probe":
+            return 0, json.dumps(self.probe(args[0], self.durations[os.path.basename(args[0])])), ""
+        if tool == "insert":
+            return 0, json.dumps({"status": "completed", "output": out,
+                                  "probe": self.probe(out, float(args[args.index("--duration") + 1]))}), ""
+        if tool == "cut":
+            start = float(args[args.index("--start") + 1])
+            end = float(args[args.index("--end") + 1]) if "--end" in args else self.durations[os.path.basename(args[0])]
+            return 0, json.dumps({"status": "completed", "output": out, "mode": "accurate", "output_duration": end - start,
+                                  "probe": self.probe(out, end - start)}), ""
+        if tool == "join":
+            total = self.join_duration
+            return 0, json.dumps({"status": "completed", "output": out, "probe": self.probe(out, total)}), ""
+        if tool == "metadata":
+            self.chapters = Path(args[args.index("--chapters") + 1]).read_text(encoding="utf-8")
+            return 0, json.dumps({"status": "completed", "output": out, "commands": []}), ""
+        raise AssertionError(tool)
+
+
+class InsertOpTests(unittest.TestCase):
+    SKILL = FfmpegSkill("/fake/ffmpeg-skill", "2.21.0", sorted(set(INSERT_TOOLS) | {"look", "scenes"}))
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.video = os.path.join(self.tmp, "talk.mp4")
+        self.demo = os.path.join(self.tmp, "demo.mp4")
+        self.page = os.path.join(self.tmp, "page-004.png")
+        for f in (self.video, self.demo, self.page):
+            Path(f).write_bytes(b"x")
+        self.tl = timeline([30, 40, 50])
+        self.tl.update(source={"path": self.video, "duration": 120.0}, provenance="OBSERVED")
+        self.out = os.path.join(self.tmp, "out.mp4")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_cut_insert_join_metadata_in_order(self):
+        r = InsertRunner({"talk.mp4": 120.0, "demo.mp4": 12.5}, join_duration=137.5)
+        res = insert_clips(self.SKILL, self.video, self.tl, [(1, self.demo), (2, self.page)], self.out,
+                           titles=["A", "B", "C"], insert_titles=["Demo"], still_duration=5, runner=r)
+        tools = [t for t, _ in r.calls]
+        self.assertEqual(tools, ["probe", "probe", "insert", "cut", "cut", "cut", "join", "metadata"])
+        ins = dict(r.calls)["insert"]
+        self.assertEqual(ins[:9], [self.page, "--duration", "5", "--width", "1920", "--height", "1080", "--fps", "30"])
+        cuts = [a for t, a in r.calls if t == "cut"]
+        self.assertEqual([(a[a.index("--start") + 1], a[a.index("--end") + 1] if "--end" in a else None) for a in cuts],
+                         [("0.000", "30.000"), ("30.000", "70.000"), ("70.000", None)])
+        self.assertTrue(all("--accurate" in a for a in cuts))
+        join = dict(r.calls)["join"]
+        names = [os.path.basename(x) for x in join[:join.index("--transition")]]
+        self.assertEqual(names, ["part-001.mp4", "demo.mp4", "part-002.mp4", "insert-002.mp4", "part-003.mp4"])
+        self.assertEqual(join[join.index("--transition"):join.index("-o")],
+                         ["--transition", "none", "--width", "1920", "--height", "1080", "--fps", "30"])
+        self.assertEqual(r.chapters, "0.000 A\n30.000 Demo\n42.500 B\n82.500 page-004\n87.500 C\n")
+        self.assertEqual(res["text"], "0:00 A\n0:30 Demo\n0:42 B\n1:22 page-004\n1:28 C\n")
+        tl = res["timeline"]
+        self.assertEqual((tl["provenance"], tl["source"]["duration"], tl["render"]["drift"]), ("DERIVED", 137.5, 0.0))
+        self.assertEqual([(e["after_slide"], e["clip_kind"], e["duration"]) for e in tl["edits"]],
+                         [(1, "video", 12.5), (2, "still", 5.0)])
+        self.assertEqual(tl["edits"][0]["clip_sha256"], hashlib.sha256(b"x").hexdigest())
+        self.assertEqual([s["tool"] for s in tl["render"]["steps"]], tools)
+        self.assertEqual(res["output"], os.path.abspath(self.out))
+
+    def test_clips_at_the_ends_need_no_cut(self):
+        r = InsertRunner({"talk.mp4": 120.0, "demo.mp4": 3.0}, join_duration=126.0)
+        res = insert_clips(self.SKILL, self.video, self.tl, [(3, self.demo), (0, self.demo)], self.out, runner=r)
+        self.assertNotIn("cut", [t for t, _ in r.calls])
+        join = dict(r.calls)["join"]
+        self.assertEqual([os.path.basename(x) for x in join[:3]], ["demo.mp4", "talk.mp4", "demo.mp4"])
+        self.assertEqual([s["start"] for s in res["timeline"]["slides"]], [0.0, 3.0, 33.0, 73.0, 123.0])
+
+    def test_drift_is_measured_and_warned(self):
+        r = InsertRunner({"talk.mp4": 120.0, "demo.mp4": 12.5}, join_duration=133.0)
+        res = insert_clips(self.SKILL, self.video, self.tl, [(1, self.demo)], self.out, runner=r)
+        self.assertEqual(res["timeline"]["render"]["drift"], 0.5)
+        self.assertTrue(any("off the predicted length" in w for w in res["warnings"]))
+
+    def test_refusals(self):
+        r = InsertRunner({"talk.mp4": 120.0, "demo.mp4": 1.0}, join_duration=121.0)
+        cases = [((self.tl, [(4, self.demo)], self.out), {}, "INVALID_ARGUMENT"),
+                 ((self.tl, [(1, os.path.join(self.tmp, "nope.mp4"))], self.out), {}, "INPUT_NOT_FOUND"),
+                 ((self.tl, [(1, self.demo)], self.video), {}, "OUTPUT_IS_INPUT"),
+                 ((self.tl, [(1, self.demo)], self.demo), {}, "OUTPUT_IS_INPUT"),
+                 ((self.tl, [], self.out), {}, "INVALID_ARGUMENT"),
+                 ((self.tl, [(1, self.demo)], self.out), {"still_duration": 0}, "INVALID_ARGUMENT"),
+                 (({"schema": "x"}, [(1, self.demo)], self.out), {}, "INVALID_TIMELINE")]
+        for args, kw, code in cases:
+            with self.assertRaises(SlideSyncError) as e:
+                insert_clips(self.SKILL, self.video, *args, runner=r, **kw)
+            self.assertEqual(e.exception.code, code, (args, kw))
+        Path(self.out).write_bytes(b"old")
+        with self.assertRaises(SlideSyncError) as e:
+            insert_clips(self.SKILL, self.video, self.tl, [(1, self.demo)], self.out, runner=r)
+        self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(r.calls, [])  # nothing ran for any refusal
+        with self.assertRaises(EngineError) as e:
+            insert_clips(FfmpegSkill("/x", "2.0.0", ["scenes", "metadata", "look"]), self.video, self.tl, [(1, self.demo)],
+                         os.path.join(self.tmp, "o2.mp4"), runner=r)
+        self.assertEqual(e.exception.code, "ENGINE_TOOL_MISSING")
+
+    def test_cli(self):
+        def run(*argv):
+            buf = io.StringIO()
+            with redirect_stdout(buf), mock.patch.object(cli, "_engine", return_value=self.SKILL):
+                rc = cli.main(list(argv) + ["--json"])  # every case is refused before ffmpeg-skill runs
+            return rc, json.loads(buf.getvalue())
+        tl = os.path.join(self.tmp, "tl.json")
+        Path(tl).write_text(json.dumps(self.tl), encoding="utf-8")
+        rc, doc = run("insert", self.video, "--timeline", tl, "--insert", "demo.mp4", "-o", self.out)
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_ARGUMENT"))
+        rc, doc = run("insert", self.video, "--timeline", tl, "--insert", f"9={self.demo}", "-o", self.out)
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_ARGUMENT"))
+        Path(self.tmp, "exists.json").write_text("{}", encoding="utf-8")
+        rc, doc = run("insert", self.video, "--timeline", tl, "--insert", f"1={self.demo}", "-o", self.out,
+                      "--timeline-out", os.path.join(self.tmp, "exists.json"))
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_ARGUMENT"))
+
+
 class ContractTests(unittest.TestCase):
     def test_os_registry_keys_and_provides(self):
         c = contract()
@@ -177,6 +393,9 @@ class ContractTests(unittest.TestCase):
         self.assertEqual({p["tool_id"] for p in c["provides"]}, {t["tool_id"] for t in c["tools"]})
         self.assertIn("slides.import", {p["id"] for p in c["provides"]})
         self.assertIn("slides.match", {p["id"] for p in c["provides"]})
+        self.assertIn("slides.insert_clips", {p["id"] for p in c["provides"]})
+        self.assertEqual(c["insert"]["provenance"], "DERIVED")
+        self.assertTrue({"cut", "join", "insert", "probe"} <= set(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"]))
         self.assertIn("look", next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"])
         self.assertEqual(c["match"]["schema"], MATCH_SCHEMA)
         optional = {d["id"]: d for d in c["dependencies"] if not d["required"]}
@@ -879,6 +1098,56 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(got, [(0, "はじめに"), (12, "方法"), (24, "結果")])
         with redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["chapters", video, "-o", out, "--json", "--ffmpeg-skill", ENGINE.root]), 4)
+
+    @staticmethod
+    def colour_at(video, t):
+        """Mean RGB of the frame at `t` seconds (fixture check through ffmpeg directly)."""
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", video, "-frames:v", "1", "-vf", "scale=1:1",
+                              "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+        return tuple(raw[:3])
+
+    def test_inserted_clips_shift_the_slides_and_chapters(self):
+        """A demo video (another size, frame rate, with sound) after slide 1 and a still after slide 2, through the real
+        ffmpeg-skill probe / insert / cut / join / metadata: chapters in the output, later slides shifted."""
+        video = self.deck("ins", [("white", 4), ("red", 4), ("blue", 4)])
+        demo = os.path.join(self.tmp, "demo.mp4")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=green:s=320x240:d=2:r=30", "-f", "lavfi",
+                        "-i", "sine=f=440:d=2", "-shortest", "-pix_fmt", "yuv420p", "-c:a", "aac", demo], check=True)
+        card = os.path.join(self.tmp, "card.png")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=yellow:s=640x360", "-frames:v", "1", card],
+                       check=True)
+        tl_file, out, shifted = (os.path.join(self.tmp, n) for n in ("ins_tl.json", "ins_out.mp4", "ins_shifted.json"))
+        Path(tl_file).write_text(json.dumps(detect(ENGINE, video, min_dwell=2)), encoding="utf-8")
+        titles = os.path.join(self.tmp, "ins_titles.txt")
+        Path(titles).write_text("はじめに\n方法\n結果\n", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["insert", video, "--timeline", tl_file, "--insert", f"1={demo}", "--insert", f"2={card}",
+                           "--insert-title", "デモ", "--insert-title", "Card", "--still-duration", "1.5", "--titles", titles,
+                           "-o", out, "--timeline-out", shifted, "--json", "--ffmpeg-skill", ENGINE.root])
+        doc = json.loads(buf.getvalue())
+        self.assertEqual(rc, 0, doc)
+        want = [(0.0, "はじめに"), (4.0, "デモ"), (6.0, "方法"), (10.0, "Card"), (11.5, "結果")]
+        self.assertEqual([c["title"] for c in doc["chapters"]], [w[1] for w in want])
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_chapters", "-show_format", "-of", "json", out],
+                               capture_output=True, text=True, check=True)
+        info = json.loads(probe.stdout)
+        got = [(float(c["start_time"]), c["tags"]["title"]) for c in info["chapters"]]
+        for (gt, gtitle), (wt, wtitle) in zip(got, want):
+            self.assertEqual(gtitle, wtitle)
+            self.assertAlmostEqual(gt, wt, delta=0.04 + 1e-6)  # one frame at 25 fps
+        self.assertEqual(len(got), len(want))
+        self.assertAlmostEqual(float(info["format"]["duration"]), 15.5, delta=0.1)
+        tl = json.loads(Path(shifted).read_text(encoding="utf-8"))
+        self.assertEqual((tl["provenance"], tl["derived_from"]["provenance"]), ("DERIVED", "OBSERVED"))
+        self.assertEqual([(e["after_slide"], e["clip_kind"]) for e in tl["edits"]], [(1, "video"), (2, "still")])
+        self.assertLessEqual(abs(tl["render"]["drift"]), 0.04 + 1e-6)
+        # the picture is where the shifted timeline says: the middle of each segment shows its colour
+        colours = {"slide": {1: (255, 255, 255), 2: (255, 0, 0), 3: (0, 0, 255)}, "insert": {1: (0, 128, 0), 2: (255, 255, 0)}}
+        for seg in tl["slides"]:
+            want_rgb = colours[seg["kind"]][seg.get("source_slide") or seg["insert"]]
+            got_rgb = self.colour_at(out, (seg["start"] + seg["end"]) / 2)
+            self.assertTrue(all(abs(g - w) <= 40 for g, w in zip(got_rgb, want_rgb)), (seg, got_rgb, want_rgb))
 
 
 def _latin(*lines):

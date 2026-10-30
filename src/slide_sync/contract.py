@@ -7,7 +7,8 @@ from typing import Any, Dict
 from . import __version__
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, TIMELINE_SCHEMA
 from .deck import DECK_SCHEMA, DEFAULT_DPI, ENV_SOFFICE, OFFICE_EXTS, TEXT_NORMALISATION
-from .engine import ENV_DIRS, REQUIRED_TOOLS
+from .engine import ENV_DIRS, INSERT_TOOLS, REQUIRED_TOOLS
+from .insert import DEFAULT_STILL_DURATION, STILL_EXTS
 from .match import (DEFAULT_MIN_MARGIN, DEFAULT_MIN_SCORE, DEFAULT_SAMPLES, FEAT_H, FEAT_W, FRAME_WIDTH, MATCH_SCHEMA,
                     METHOD)
 
@@ -36,6 +37,15 @@ TOOLS = [
      "argv": ["match", "<video>", "--deck <dir>", "[--timeline <timeline.json>]", f"[--min-score {DEFAULT_MIN_SCORE:g}]",
               f"[--min-margin {DEFAULT_MIN_MARGIN:g}]", f"[--samples {DEFAULT_SAMPLES}]", "[-o <match.json>]", "[--overwrite]",
               "--json"]},
+    {"tool_id": "slide-sync/insert", "role": "execution", "writes_media": True, "mutates_input": False, "deterministic": True,
+     "description": "Splice clips into a recording at slide boundaries (a demo video as it is, an image as a still clip): "
+                    "ffmpeg-skill probe / insert / cut --accurate / join --transition none, then the shifted timeline's "
+                    "chapters through metadata. Every slide after an insertion moves later by the clip's measured "
+                    "length; the timeline (provenance DERIVED) records each edit",
+     "argv": ["insert", "<video>", "--insert N=<clip>", "[--insert N=<clip> ...]", "[--insert-title <title> ...]",
+              f"[--still-duration {DEFAULT_STILL_DURATION:g}]", "[--timeline <timeline.json>]", "[--titles <titles.txt>]",
+              "[--prefix Slide]", "[--min-chapter <s>]", "[--chapters-out <txt>]", "[--timeline-out <json>]", "-o <video>",
+              "[--overwrite]", "--json"]},
 ]
 
 ERRORS = {
@@ -65,9 +75,11 @@ def contract() -> Dict[str, Any]:
         "provides": [{"id": "slides.detect_changes", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/detect"},
                      {"id": "slides.chapters", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/chapters"},
                      {"id": "slides.import", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/import"},
-                     {"id": "slides.match", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/match"}],
+                     {"id": "slides.match", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/match"},
+                     {"id": "slides.insert_clips", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/insert"}],
         "dependencies": [{"id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <3.0.0",
-                          "tools": list(REQUIRED_TOOLS), "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
+                          "tools": list(REQUIRED_TOOLS) + [t for t in INSERT_TOOLS if t not in REQUIRED_TOOLS],
+                          "tools_for": {"slide-sync/insert": list(INSERT_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
                           + ["~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
                          {"id": "pypdfium2", "kind": "python", "required": False, "extra": "pdf", "version_range": ">=4.30",
                           "licence": "Apache-2.0 OR BSD-3-Clause", "for": ["slide-sync/import"]},
@@ -79,12 +91,17 @@ def contract() -> Dict[str, Any]:
         "not_provided": ["slide text from images or scanned pages (OCR: detection-skill)",
                          "matching by slide text (OCR of the frames is detection-skill's; match compares pictures)",
                          "running ffmpeg or ffprobe directly (only through ffmpeg-skill)",
-                         "editing or re-encoding the picture", "network access of any kind"],
+                         "editing the picture or cutting the talk beyond splicing clips in at slide boundaries "
+                         "(video-editing-skill)", "network access of any kind"],
         "tools": TOOLS,
         "timeline": {"schema": TIMELINE_SCHEMA, "provenance": "OBSERVED"},
         "match": {"schema": MATCH_SCHEMA, "provenance": "OBSERVED", "method": METHOD, "min_score": DEFAULT_MIN_SCORE,
                   "min_margin": DEFAULT_MIN_MARGIN, "samples": DEFAULT_SAMPLES, "frame_width": FRAME_WIDTH,
                   "feature": [FEAT_W, FEAT_H], "unmatched": "page null with reason below_min_score or ambiguous"},
+        "insert": {"schema": TIMELINE_SCHEMA, "provenance": "DERIVED", "at": "slide boundaries (after slide N, 0 = start)",
+                   "still_extensions": list(STILL_EXTS), "default_still_duration": DEFAULT_STILL_DURATION,
+                   "shift": "every segment after an insertion moves later by the clip's measured duration",
+                   "records": ["derived_from", "edits", "render"]},
         "deck": {"schema": DECK_SCHEMA, "provenance": "OBSERVED", "default_dpi": DEFAULT_DPI,
                  "text_normalisation": TEXT_NORMALISATION},
         "execution": {"canonical_invocation": ["slide-sync", "<command>", "...", "--json"], "network": False, "shell": False,

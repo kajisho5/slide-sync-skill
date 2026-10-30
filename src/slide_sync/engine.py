@@ -15,6 +15,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 ENV_DIRS = ("SLIDE_SYNC_FFMPEG_SKILL_DIR", "FFMPEG_SKILL_DIR")
 REQUIRED_TOOLS = ("scenes", "metadata", "look")
+# `insert` (splicing clips in at slide boundaries) also needs these; checked by that command and reported by doctor,
+# but not required for detect / chapters / match.
+INSERT_TOOLS = ("probe", "cut", "insert", "join", "metadata")
 
 Runner = Callable[[List[str], float], Tuple[int, str, str]]
 
@@ -81,12 +84,15 @@ def engine_doctor(skill: FfmpegSkill, *, timeout: float = 60.0, runner: Runner =
         rc, out, err = runner(argv, timeout)
         doc = json.loads(out)
     except (subprocess.TimeoutExpired, ValueError, OSError):
-        return {"ok": False, "ffmpeg": None, "ffprobe": None, "tools": {}, "detail": "ffmpeg-skill doctor did not answer"}
+        return {"ok": False, "ffmpeg": None, "ffprobe": None, "tools": {}, "insert_tools": {},
+                "detail": "ffmpeg-skill doctor did not answer"}
     if not isinstance(doc, dict):
         doc = {}
-    tools = {t: ((doc.get("tools") or {}).get(t) or {}).get("usable") for t in REQUIRED_TOOLS}
+    usable = {t: ((doc.get("tools") or {}).get(t) or {}).get("usable") for t in REQUIRED_TOOLS + INSERT_TOOLS}
+    tools = {t: usable[t] for t in REQUIRED_TOOLS}
     return {"ok": bool(doc.get("ok")) and all(v == "yes" for v in tools.values()), "ffmpeg": doc.get("ffmpeg"),
-            "ffprobe": doc.get("ffprobe"), "tools": tools, "detail": None}
+            "ffprobe": doc.get("ffprobe"), "tools": tools, "insert_tools": {t: usable[t] for t in INSERT_TOOLS},
+            "detail": None}
 
 
 def run_tool(skill: FfmpegSkill, tool: str, args: List[str], *, timeout: float = 3600.0,
