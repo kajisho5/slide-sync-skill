@@ -397,6 +397,8 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(c["insert"]["provenance"], "DERIVED")
         self.assertTrue({"cut", "join", "insert", "probe"} <= set(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"]))
         self.assertIn("look", next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"])
+        # ffmpeg-skill 3.x accepted (ADR-004): the tools and keys used here did not change in 3.0.0
+        self.assertEqual(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["version_range"], ">=2.0.0 <4.0.0")
         self.assertEqual(c["match"]["schema"], MATCH_SCHEMA)
         optional = {d["id"]: d for d in c["dependencies"] if not d["required"]}
         self.assertEqual(set(optional), {"pypdfium2", "libreoffice"})

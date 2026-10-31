@@ -212,3 +212,27 @@ Decided 2026-10-30, checked against ffmpeg-skill 2.21.0 (`scripts/_contract.py -
 - A clip of another aspect ratio is padded (join's default `--fit pad`), not cropped.
 - Clips go only at slide boundaries. A clip inside a slide, a cross-fade, or cutting parts of the talk out is editing: video-editing-skill.
 - `match` on the output gives the inserted segments `page: null` (they are not deck pages), as it should.
+
+## ADR-004 ffmpeg-skill 3.x accepted (`>=2.0.0 <4.0.0`), with 3.0's `cut` defaults
+
+Decided 2026-10-31, checked against ffmpeg-skill v3.0.0 (CHANGELOG "3.0.0", `docs/contract.md` "What 3.0 changed", `contract --json` `removed`).
+
+### What 3.0.0 changed, and what reaches this skill
+
+| 3.0.0 change | Reaches this skill? |
+|---|---|
+| Python 3.9 and FFmpeg 5.x no longer supported | Only the environment: ffmpeg-skill's scripts run under this skill's interpreter, so a 3.x checkout needs Python 3.10+ and FFmpeg 6.1+. ffmpeg-skill 3.x refuses an older FFmpeg itself (`missing_tool`, `ffmpeg_unsupported`; here `ENGINE_FAILED` with its message), and its own `doctor` reports an old Python or FFmpeg as `ok: false`, which `slide-sync doctor` passes on |
+| `cut`: edit list kept on a stream copy; `--vfr-guard sampled` | No: `insert` always cuts with `--accurate` (a re-encode), and the guard and the edit list are about stream copies |
+| `cut`: an SDR HEVC source re-encodes as HEVC (2.x: x264) | Only the intermediate parts: `join --transition none --width --height --fps` re-encodes every part and clip with its own encoder, so the output is the same either way |
+| `cut`: `precision`, `keyframe_snapped` meanings | No: `insert` reads `mode`, `probe.duration` and `output_duration` only |
+| `probe`: `timecode` added | No (additive) |
+
+### Decision
+
+- **Range `>=2.0.0 <4.0.0`** in the contract. No 2.x flags (`--no-edit-list`, `--no-keep-hevc`, `--vfr-guard average`) are passed: none changes what `insert` produces, and passing them only for 3.x would add a version branch for nothing.
+- **Python 3.9 stays** (`requires-python >=3.9`) for use with ffmpeg-skill 2.x; with 3.x the environment needs Python 3.10+, which ffmpeg-skill's own doctor reports.
+- **CI** runs the integration job (real ffmpeg-skill, import, match and insert tests, none may skip) against the tags `v2.24.1` and `v3.0.0` instead of `main`. The unit jobs keep Python 3.9 / 3.12 with ffmpeg-skill faked.
+
+### Evidence
+
+All 56 tests pass locally against ffmpeg-skill v3.0.0 and v2.24.1 (Python 3.11, FFmpeg 6.1.1), including `IntegrationTests.test_inserted_clips_shift_the_slides_and_chapters` (chapters at 0, 4, 6, 10, 11.5 s; every segment's colour).

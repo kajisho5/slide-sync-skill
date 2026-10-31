@@ -30,13 +30,20 @@ jobs:
 
   integration:
     # The real engine: ffmpeg-skill (read-only checkout) and ffmpeg from apt; LibreOffice and a Japanese font for import;
-    # the shuffled-slides match fixture (import + ffmpeg + detect + match).
+    # the shuffled-slides match fixture (import + ffmpeg + detect + match). ffmpeg-skill runs at both ends of the
+    # supported range (>=2.0.0 <4.0.0, ADR-004): the last 2.x tag and v3.0.0, on Ubuntu 24.04's FFmpeg 6.1.
+    name: integration (ffmpeg-skill ${{ matrix.ffmpeg_skill }})
+    strategy:
+      fail-fast: false
+      matrix:
+        ffmpeg_skill: [v2.24.1, v3.0.0]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
           repository: kajisho5/ffmpeg-skill
+          ref: ${{ matrix.ffmpeg_skill }}
           path: ffmpeg-skill
       - uses: actions/setup-python@v5
         with:
