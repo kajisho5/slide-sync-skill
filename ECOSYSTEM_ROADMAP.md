@@ -33,7 +33,7 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` 
   - Done when: shuffled-slides fixture
 - [x] **5. Chapters / insert clips** — via ffmpeg-skill metadata and insert (chapters in 0.1.0; insert clips in [#6](https://github.com/kajisho5/slide-sync-skill/pull/6), `insert`; ADR-003)
   - Done when: chapters in the output
-- [ ] **6. SKILL.md, CI; (agent side) adapter** (SKILL.md and CI done in 0.1.0; the agent adapter remains)
+- [ ] **6. SKILL.md, CI; (agent side) adapter** (skill side done in 0.1.0, checked in [#7](https://github.com/kajisho5/slide-sync-skill/pull/7): `SKILL.md` documents every CLI command (`detect`, `chapters`, `import`, `match`, `insert`, `contract`, `doctor`) with examples; `.github/workflows/tests.yml` (unit: Linux / macOS / Windows x Python 3.9 / 3.12 plus `slide-sync contract --json`; integration: ffmpeg-skill + ffmpeg + LibreOffice + pypdfium2, the slide tests must not skip, `doctor`); it checks out no OS repository. The agent adapter remains in video-production-agent)
 
 ## Boundaries
 
