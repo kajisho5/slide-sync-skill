@@ -19,7 +19,7 @@ Since then: `import` (deck -> per-page PNG + text; pypdfium2 as the optional `pd
 
 ## Wiring
 
-ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` (frames for match), and `probe` / `cut` / `insert` / `join` (insert clips). Import uses pypdfium2 (optional extra `pdf`) and, for non-PDF decks, a system LibreOffice; neither goes through ffmpeg-skill. No agent adapter yet (step 6).
+ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` (frames for match), and `probe` / `cut` / `insert` / `join` (insert clips); dependency `>=2.0.0 <4.0.0` (ffmpeg-skill 3.x accepted in [#8](https://github.com/kajisho5/slide-sync-skill/pull/8), ADR-004). Import uses pypdfium2 (optional extra `pdf`) and, for non-PDF decks, a system LibreOffice; neither goes through ffmpeg-skill. No agent adapter yet (step 6).
 
 ## Steps
 

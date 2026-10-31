@@ -77,7 +77,7 @@ def contract() -> Dict[str, Any]:
                      {"id": "slides.import", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/import"},
                      {"id": "slides.match", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/match"},
                      {"id": "slides.insert_clips", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/insert"}],
-        "dependencies": [{"id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <3.0.0",
+        "dependencies": [{"id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <4.0.0",
                           "tools": list(REQUIRED_TOOLS) + [t for t in INSERT_TOOLS if t not in REQUIRED_TOOLS],
                           "tools_for": {"slide-sync/insert": list(INSERT_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
                           + ["~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
