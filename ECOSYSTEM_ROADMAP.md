@@ -34,6 +34,15 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` 
 - [x] **5. Chapters / insert clips** — via ffmpeg-skill metadata and insert (chapters in 0.1.0; insert clips in [#6](https://github.com/kajisho5/slide-sync-skill/pull/6), `insert`; ADR-003)
   - Done when: chapters in the output
 - [x] **6. SKILL.md, CI; (agent side) adapter** (skill side done in 0.1.0, checked in [#7](https://github.com/kajisho5/slide-sync-skill/pull/7): `SKILL.md` documents every CLI command (`detect`, `chapters`, `import`, `match`, `insert`, `contract`, `doctor`) with examples; `.github/workflows/tests.yml` (unit: Linux / macOS / Windows x Python 3.9 / 3.12 plus `slide-sync contract --json`; integration: ffmpeg-skill + ffmpeg + LibreOffice + pypdfium2, the slide tests must not skip, `doctor`); it checks out no OS repository. Agent side: [video-production-agent#106](https://github.com/kajisho5/video-production-agent/pull/106) (its ADR-091) measures `detect` (and, with the deck, `import` + `match`) as the analysis kind `slide_timeline` for `slides.detect=true`, as an OBSERVED Observation and SlideEvents; without slide-sync-skill the measurement is handed off)
+- [ ] **7. Layout plan for slide talks** — from `match`, a layout per segment (slide full, speaker picture-in-picture on the slide, side by side, speaker full during Q&A) written as a plan for ffmpeg-skill `broll` / `overlay`, with the rule used per segment. Field review 2026-11-05 (Velisa ROADMAP, third round)
+  - なぜ要るか：スライド収録と登壇者カメラを、セッションごとに手で組まずにアーカイブの画にできる
+  - Done when: a fixture with slides then Q&A gives PiP for the slides and speaker full for the Q&A
+- [ ] **8. Clean deck pages over the captured slide** — where `match` is confident, the captured slide area (located and de-keystoned already) is replaced by the deck page, sharp and at the output size, for the matched time; a low-confidence match keeps the capture
+  - なぜ要るか：プロジェクターを撮った眠いスライドを、元の資料の鮮明な画に差し替えられる
+  - Done when: a fixture's replaced frames have higher sharpness than the capture, and an unmatched span is left as captured
+- [ ] **9. Slide changes from a recording in progress** — `detect --follow` on a growing recording or capture feed emits slide changes as they happen (JSON lines), for live chapters and for cutting clips while the session runs
+  - なぜ要るか：配信中に章立てを作り、終演直後に章付きアーカイブを出せる
+  - Done when: a fixture appended in bursts yields the same changes as a batch run
 
 ## Boundaries
 
