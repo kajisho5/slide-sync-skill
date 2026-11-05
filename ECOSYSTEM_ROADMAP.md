@@ -19,7 +19,7 @@ Since then: `import` (deck -> per-page PNG + text; pypdfium2 as the optional `pd
 
 ## Wiring
 
-ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` (frames for match), and `probe` / `cut` / `insert` / `join` (insert clips); dependency `>=2.0.0 <4.0.0` (ffmpeg-skill 3.x accepted in [#8](https://github.com/kajisho5/slide-sync-skill/pull/8), ADR-004). Import uses pypdfium2 (optional extra `pdf`) and, for non-PDF decks, a system LibreOffice; neither goes through ffmpeg-skill. No agent adapter yet (step 6).
+ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` (frames for match), and `probe` / `cut` / `insert` / `join` (insert clips); dependency `>=2.0.0 <4.0.0` (ffmpeg-skill 3.x accepted in [#8](https://github.com/kajisho5/slide-sync-skill/pull/8), ADR-004). Import uses pypdfium2 (optional extra `pdf`) and, for non-PDF decks, a system LibreOffice; neither goes through ffmpeg-skill. The agent measures `detect` (with a deck, `import` + `match`) as `slide_timeline` (step 6, video-production-agent#106); chapters and inserts are not planned from it yet.
 
 ## Steps
 
@@ -40,4 +40,4 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` 
 Slide text OCR comes from detection-skill, not a second OCR.
 
 ---
-Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (42 tools, treated as complete). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).
+Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (3.x, 42 tools, contract_version 2.0; treated as complete, proposals go to Velisa's ROADMAP). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).
