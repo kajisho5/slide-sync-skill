@@ -40,8 +40,8 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` 
 - [ ] **8. Clean deck pages over the captured slide** — where `match` is confident, the captured slide area (located and de-keystoned already) is replaced by the deck page, sharp and at the output size, for the matched time; a low-confidence match keeps the capture
   - なぜ要るか：プロジェクターを撮った眠いスライドを、元の資料の鮮明な画に差し替えられる
   - Done when: a fixture's replaced frames have higher sharpness than the capture, and an unmatched span is left as captured
-- [ ] **9. Slide changes from a recording in progress** — `detect --follow` on a growing recording or capture feed emits slide changes as they happen (JSON lines), for live chapters and for cutting clips while the session runs
-  - なぜ要るか：配信中に章立てを作り、終演直後に章付きアーカイブを出せる
+- [ ] **9. Slide changes from a recording in progress** — `detect --follow` on a recording still being written emits slide changes as they are found (JSON lines), so the chapters are ready when the recording closes
+  - なぜ要るか：収録中に章立てを進め、終演直後に章付きアーカイブを出せる
   - Done when: a fixture appended in bursts yields the same changes as a batch run
 
 ## Boundaries
