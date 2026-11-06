@@ -6,7 +6,9 @@ Import tests build their PDF / PPTX decks here at test time; they need pypdfium2
 real-LibreOffice test also needs soffice. Match unit tests draw their pages and frames in Python; the shuffled-slides
 integration test imports a generated PDF, films it with ffmpeg in shuffled order (screen capture and keystoned camera)
 and needs ffmpeg-skill, ffmpeg and pypdfium2. Insert unit tests shift timelines and fake ffmpeg-skill; the insert
-integration test splices generated clips into a generated talk with the real ffmpeg-skill.
+integration test splices generated clips into a generated talk with the real ffmpeg-skill. Layout unit tests assign
+layouts to faked match documents; the layout integration test (slides then Q&A) matches and renders a generated talk
+with a generated speaker camera through the real ffmpeg-skill overlay / broll.
 
     python -m unittest -v tests/test_slide_sync.py
 """
@@ -41,6 +43,7 @@ from slide_sync.engine import INSERT_TOOLS, EngineError, FfmpegSkill, locate, ru
 from slide_sync.insert import insert_clips, parse_insert, segment_titles, shift_timeline  # noqa: E402
 from slide_sync import match as match_mod  # noqa: E402
 from slide_sync.match import MATCH_SCHEMA, decide, match, quad_sampler, read_png, sample_times, slide_quad  # noqa: E402
+from slide_sync.layout import LAYOUT_SCHEMA, assign, plan_layout, render_layout, side_band, spans_of  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -394,6 +397,9 @@ class ContractTests(unittest.TestCase):
         self.assertIn("slides.import", {p["id"] for p in c["provides"]})
         self.assertIn("slides.match", {p["id"] for p in c["provides"]})
         self.assertIn("slides.insert_clips", {p["id"] for p in c["provides"]})
+        self.assertIn("slides.layout_plan", {p["id"] for p in c["provides"]})
+        self.assertEqual((c["layout"]["schema"], c["layout"]["provenance"]), (LAYOUT_SCHEMA, "DERIVED"))
+        self.assertTrue({"overlay", "broll"} <= set(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"]))
         self.assertEqual(c["insert"]["provenance"], "DERIVED")
         self.assertTrue({"cut", "join", "insert", "probe"} <= set(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"]))
         self.assertIn("look", next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"])
@@ -433,6 +439,183 @@ class ContractTests(unittest.TestCase):
             text = f.read_text(encoding="utf-8")
             self.assertNotIn("shell=True", text, f.name)
             self.assertIsNone(launch.search(text), f"{f.name} launches ffmpeg/ffprobe itself")
+
+
+# ------------------------------------------------------------------ layout (roadmap step 7)
+
+def match_doc(pages, seconds, views=None, deck=None, source=None):
+    """A slide-sync/match@1 document: one segment per (page or None) lasting `seconds[i]`."""
+    segs, t = [], 0.0
+    for i, (p, d) in enumerate(zip(pages, seconds)):
+        segs.append({"index": i + 1, "start": t, "end": t + d, "page": p, "confidence": 0.95 if p else 0.05,
+                     "reason": None if p else "below_min_score", "view": (views or {}).get(i + 1, "full")})
+        t += d
+    return {"schema": MATCH_SCHEMA, "source": {"path": source, "duration": t}, "deck": {"path": deck}, "segments": segs}
+
+
+class LayoutRunner:
+    """Fake ffmpeg-skill for `layout`: probe answers from a table, overlay / broll write their -o file."""
+
+    def __init__(self, media):
+        self.media = media  # basename -> (width, height, duration)
+        self.calls = []
+
+    def __call__(self, argv, timeout):
+        tool, args = Path(argv[1]).stem, argv[2:]
+        self.calls.append((tool, args))
+        if tool == "probe":
+            w, h, d = self.media[os.path.basename(args[0])]
+            return 0, json.dumps({"duration": d, "video": {"width": w, "height": h, "fps": 25.0, "duration": d}}), ""
+        out = args[args.index("-o") + 1]
+        Path(out).write_bytes(b"rendered")
+        return 0, json.dumps({"status": "completed", "output": out, "verified": True}), ""
+
+
+class LayoutUnitTests(unittest.TestCase):
+    SKILL = FfmpegSkill("/fake/ffmpeg-skill", "3.0.0", sorted({"look", "metadata", "scenes", "probe", "overlay", "broll"}))
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.video = os.path.join(self.tmp, "talk.mp4")
+        self.cam = os.path.join(self.tmp, "speaker.mp4")
+        for f in (self.video, self.cam):
+            Path(f).write_bytes(b"x")
+        self.runner = LayoutRunner({"talk.mp4": (1920, 1080, 20.0), "speaker.mp4": (1920, 1080, 25.0)})
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def plan(self, m, **kw):
+        kw.setdefault("camera", self.cam)
+        return plan_layout(self.SKILL, self.video, m, output=os.path.join(self.tmp, "out.mp4"), runner=self.runner, **kw)
+
+    def test_slides_then_qa_give_pip_then_speaker_full(self):
+        """Done when (step 7): slides then Q&A -> PiP for the slides, speaker full for the Q&A."""
+        p = self.plan(match_doc([1, 2, 3, None], [4, 4, 4, 8]))
+        self.assertEqual(p["schema"], LAYOUT_SCHEMA)
+        self.assertEqual([(s["layout"], s["rule"]) for s in p["segments"]],
+                         [("slide_pip", "deck_page")] * 3 + [("speaker_full", "after_last_deck_page")])
+        self.assertEqual([(s["start"], s["end"], s["layout"]) for s in p["spans"]],
+                         [(0.0, 12.0, "slide_pip"), (12.0, 20.0, "speaker_full")])
+        self.assertEqual([s["tool"] for s in p["steps"]], ["overlay", "broll"])
+        ov, br = p["steps"]
+        self.assertEqual(ov["args"], [self.video, "--video", self.cam, "--position", "bottom-right", "--scale-percent", "25",
+                                      "--place", "0.000-12.000@0.000", "-o", ov["output"]])
+        self.assertTrue(ov["intermediate"])
+        self.assertEqual(br["args"], [ov["output"], "--insert", self.cam, "--at", "12.000", "--end", "20.000", "--from",
+                                      "12.000", "--audio", "a", "-o", os.path.join(self.tmp, "out.mp4")])
+        self.assertEqual(p["layouts"], {"slide_full": 0, "slide_pip": 3, "side_by_side": 0, "speaker_full": 1})
+        self.assertEqual(p["provenance"], "DERIVED")
+        self.assertEqual(p["warnings"], [])
+        self.assertEqual([c[0] for c in self.runner.calls], ["probe", "probe"])  # a plan renders nothing
+
+    def test_every_segment_names_its_rule(self):
+        segs = match_doc([None, 1, None, 2, None], [3, 4, 3, 4, 6])["segments"]
+        got = assign(segs, camera=True)
+        self.assertEqual([(p["layout"], p["rule"]) for p in got],
+                         [("speaker_full", "before_first_deck_page"), ("slide_pip", "deck_page"),
+                          ("slide_pip", "unmatched_mid_talk_kept"), ("slide_pip", "deck_page"),
+                          ("speaker_full", "after_last_deck_page")])
+        self.assertTrue(all(p["why"] for p in got))
+        got = assign(segs, camera=True, unmatched="speaker")
+        self.assertEqual(got[2]["rule"], "unmatched_speaker")
+        self.assertEqual({p["layout"] for p in assign(segs, camera=False)}, {"slide_full"})
+        self.assertEqual({p["rule"] for p in assign(segs, camera=False)}, {"no_camera"})
+        self.assertEqual([p["layout"] for p in assign(segs, camera=True, slides="full")],
+                         ["speaker_full", "slide_full", "slide_full", "slide_full", "speaker_full"])
+        nothing = assign(match_doc([None, None], [3, 3])["segments"], camera=True)
+        self.assertEqual({p["rule"] for p in nothing}, {"no_deck_page"})
+
+    def test_qa_from_splits_a_segment_and_wins(self):
+        # the last page stays up during Q&A: --qa-from says when the talk ended
+        got = assign(match_doc([1, 2], [5, 10])["segments"], camera=True, qa_from=9.0)
+        self.assertEqual([(p["start"], p["end"], p["layout"], p["rule"]) for p in got],
+                         [(0.0, 5.0, "slide_pip", "deck_page"), (5.0, 9.0, "slide_pip", "deck_page"),
+                          (9.0, 15.0, "speaker_full", "qa_from")])
+        self.assertEqual([(s["start"], s["end"], s["segments"]) for s in spans_of(got)],
+                         [(0.0, 9.0, [1, 2]), (9.0, 15.0, [2])])
+
+    def test_camera_offset_and_coverage(self):
+        # the camera started 2 s after the recording and is 15 s long: it covers 2-17 s of the recording
+        self.runner.media["speaker.mp4"] = (1280, 720, 15.0)
+        p = self.plan(match_doc([1, 2, None], [6, 6, 8]), camera_offset=-2.0)
+        self.assertEqual(p["camera"]["covers"], [2.0, 17.0])
+        self.assertEqual([(s["start"], s["end"], s["layout"], s["rule"]) for s in p["segments"]],
+                         [(0.0, 2.0, "slide_full", "camera_not_covering"), (2.0, 6.0, "slide_pip", "deck_page"),
+                          (6.0, 12.0, "slide_pip", "deck_page"), (12.0, 17.0, "speaker_full", "after_last_deck_page"),
+                          (17.0, 20.0, "slide_full", "camera_not_covering")])
+        ov, br = p["steps"]
+        self.assertIn("0.000-10.000@2.000", ov["args"])  # camera time = recording time + offset
+        self.assertEqual(br["args"][br["args"].index("--from") + 1], "10.000")
+        self.assertTrue(any("covers 2.000-17.000s" in w for w in p["warnings"]))
+
+    def test_side_by_side_beside_a_pillarboxed_4_3_slide(self):
+        deck = os.path.join(self.tmp, "pages")
+        os.mkdir(deck)
+        Path(deck, "deck.json").write_text(json.dumps({"schema": DECK_SCHEMA, "pages": [
+            {"index": 1, "image": "page-001.png", "width_px": 1024, "height_px": 768},
+            {"index": 2, "image": "page-002.png", "width_px": 1920, "height_px": 1080}]}), encoding="utf-8")
+        m = match_doc([1, 2], [5, 5], views={1: "fit 1.333", 2: "full"}, deck=deck)
+        p = self.plan(m)
+        self.assertEqual([(s["layout"], s["rule"]) for s in p["segments"]],
+                         [("side_by_side", "deck_page_side_band"), ("slide_pip", "deck_page")])
+        side = next(s for s in p["steps"] if "--scale" in s["args"])
+        a = side["args"]
+        # 1440 px of slide in 1920: a 240 px band each side; the 16:9 camera at 240 x 136, centred vertically
+        self.assertEqual((a[a.index("--position") + 1], a[a.index("--scale") + 1], a[a.index("--margin") + 1]),
+                         ("1680,472", "240", "0"))
+        self.assertEqual([s["layout"] for s in self.plan(m, slides="pip")["segments"]], ["slide_pip", "slide_pip"])
+        self.assertEqual(self.plan(m, slides="side")["segments"][1]["rule"], "deck_page_no_side_band")
+        self.assertEqual(side_band("located", 4 / 3, 1920, 1080), 0)   # a camera on the projection: position unknown
+        self.assertEqual(side_band("fit 1.778", 16 / 9, 1920, 1080), 0)
+
+    def test_render_runs_the_steps_and_removes_intermediates(self):
+        p = self.plan(match_doc([1, None], [10, 10]))
+        r = render_layout(self.SKILL, p, runner=self.runner)
+        self.assertEqual([s["tool"] for s in r["steps"]], ["overlay", "broll"])
+        self.assertTrue(os.path.isfile(r["output"]))
+        self.assertFalse(os.path.exists(p["steps"][0]["output"]))
+        with self.assertRaises(SlideSyncError):
+            render_layout(self.SKILL, p, runner=self.runner)  # the output exists
+        render_layout(self.SKILL, p, overwrite=True, runner=self.runner)
+        self.assertIn("--overwrite", self.runner.calls[-1][1])
+        old = FfmpegSkill("/fake/ffmpeg-skill", "2.12.0", self.SKILL.tools)
+        with self.assertRaises(EngineError):
+            render_layout(old, p, overwrite=True, runner=self.runner)
+        nocam = self.plan(match_doc([1, None], [10, 10]), camera=None)
+        self.assertEqual((nocam["steps"], nocam["output"]), ([], None))
+        with self.assertRaises(SlideSyncError):
+            render_layout(self.SKILL, nocam, runner=self.runner)
+
+    def test_refusals(self):
+        m = match_doc([1], [20])
+        for kw, code in (({"camera": os.path.join(self.tmp, "nope.mp4")}, "INPUT_NOT_FOUND"),
+                         ({"pip_width": 80}, "INVALID_ARGUMENT"), ({"pip_position": "middle"}, "INVALID_ARGUMENT"),
+                         ({"slides": "grid"}, "INVALID_ARGUMENT"), ({"qa_from": -1}, "INVALID_ARGUMENT")):
+            with self.assertRaises(SlideSyncError) as e:
+                self.plan(m, **kw)
+            self.assertEqual(e.exception.code, code, kw)
+        with self.assertRaises(SlideSyncError):
+            self.plan({"schema": TIMELINE_SCHEMA, "slides": []})
+        with self.assertRaises(SlideSyncError) as e:
+            plan_layout(self.SKILL, self.video, m, camera=self.cam, output=self.cam, runner=self.runner)
+        self.assertEqual(e.exception.code, "OUTPUT_IS_INPUT")
+
+    def test_cli(self):
+        mfile, plan = os.path.join(self.tmp, "match.json"), os.path.join(self.tmp, "plan.json")
+        Path(mfile).write_text(json.dumps(match_doc([1, 2, None], [5, 5, 10], source=self.video)), encoding="utf-8")
+        buf = io.StringIO()
+        fake = lambda skill, tool, args, **kw: run_tool(skill, tool, args, timeout=kw.get("timeout", 60), runner=self.runner)
+        with mock.patch.object(cli, "_engine", return_value=self.SKILL), \
+                mock.patch("slide_sync.layout.run_tool", fake), redirect_stdout(buf):
+            rc = cli.main(["layout", self.video, "--match", mfile, "--camera", self.cam, "--plan-out", plan, "--json"])
+        doc = json.loads(buf.getvalue())
+        self.assertEqual((rc, doc["ok"], doc["rendered"]), (0, True, None))
+        self.assertEqual([s["layout"] for s in doc["segments"]], ["slide_pip", "slide_pip", "speaker_full"])
+        self.assertEqual(json.loads(Path(plan).read_text(encoding="utf-8"))["derived_from"]["path"], os.path.abspath(mfile))
+        with redirect_stdout(io.StringIO()), mock.patch.object(cli, "_engine", return_value=self.SKILL):
+            self.assertEqual(cli.main(["layout", self.video, "--match", mfile, "--deck", self.tmp, "--json"]), 2)
+            self.assertEqual(cli.main(["layout", self.video, "--match", mfile, "--plan-out", plan, "--json"]), 2)
 
 
 # ------------------------------------------------------------------ slide import fixtures (built at test time)
@@ -1247,6 +1430,68 @@ class ShuffledSlidesTests(unittest.TestCase):
         self.assertEqual([s["page"] for s in m["segments"]], SHUFFLE_PAGES)
         self.assertTrue(all(s["view"] == "located" for s in m["segments"] if s["page"] is not None))
         self.assertTrue(any("measured on" in w for w in m["warnings"]))  # the timeline came from the screen recording
+
+
+def region_colour(video, t, box):
+    """Mean RGB of the box (x, y, w, h) of the frame at `t` seconds (fixture check through ffmpeg directly)."""
+    x, y, w, h = box
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", video, "-frames:v", "1", "-vf",
+                          f"crop={w}:{h}:{x}:{y},scale=1:1:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                         capture_output=True, check=True).stdout
+    return tuple(raw[:3])
+
+
+@unittest.skipUnless(ENGINE and shutil.which("ffmpeg") and HAS_PDFIUM, "needs ffmpeg-skill, ffmpeg and pypdfium2")
+class SlideTalkLayoutTests(unittest.TestCase):
+    """Roadmap step 7's done-when fixture: three deck pages then Q&A (the projector blanked), a speaker camera beside
+    it; import, detect, match and layout by the real ffmpeg-skill, and the plan rendered through overlay / broll."""
+
+    def test_slides_get_pip_and_the_qa_gets_the_speaker_full(self):
+        with tempfile.TemporaryDirectory() as t:
+            Path(t, "deck.pdf").write_bytes(build_pdf(SHUFFLE_DECK[:3]))
+            import_deck(os.path.join(t, "deck.pdf"), os.path.join(t, "pages"), dpi=72)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=960x540", "-frames:v", "1",
+                            os.path.join(t, "black.png")], check=True)
+            show = [(os.path.join(t, "pages", f"page-00{i}.png"), 4) for i in (1, 2, 3)] + [(os.path.join(t, "black.png"), 6)]
+            lst = os.path.join(t, "show.txt")
+            Path(lst).write_text("".join(f"file '{f}'\nduration {d}\n" for f, d in show) + f"file '{show[-1][0]}'\n",
+                                 encoding="utf-8")
+            talk, cam, out = (os.path.join(t, n) for n in ("talk.mp4", "speaker.mp4", "talk_layout.mp4"))
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-f", "lavfi", "-i",
+                            "sine=f=330:d=18", "-vf", "scale=640:360,fps=25,format=yuv420p", "-c:v", "libx264", "-c:a", "aac",
+                            "-shortest", talk], check=True)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=green:s=640x360:d=19:r=25",
+                            "-pix_fmt", "yuv420p", cam], check=True)
+            plan_file = os.path.join(t, "layout.json")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main(["layout", talk, "--deck", os.path.join(t, "pages"), "--camera", cam, "--plan-out", plan_file,
+                               "-o", out, "--json", "--ffmpeg-skill", ENGINE.root])
+            doc = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, doc)
+            self.assertEqual([(s["page"], s["layout"], s["rule"]) for s in doc["segments"]],
+                             [(1, "slide_pip", "deck_page"), (2, "slide_pip", "deck_page"), (3, "slide_pip", "deck_page"),
+                              (None, "speaker_full", "after_last_deck_page")])
+            self.assertEqual([s["tool"] for s in doc["steps"]], ["overlay", "broll"])
+            self.assertEqual(json.loads(Path(plan_file).read_text(encoding="utf-8"))["segments"], doc["segments"])
+            self.assertEqual(sorted(os.listdir(t)), sorted(["black.png", "deck.pdf", "layout.json", "pages", "show.txt",
+                                                            "speaker.mp4", "talk.mp4", "talk_layout.mp4"]))  # no leftovers
+            info = json.loads(subprocess.run(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", out],
+                                             capture_output=True, text=True, check=True).stdout)
+            self.assertAlmostEqual(float(info["format"]["duration"]), 18.0, delta=0.1)
+            self.assertIn("audio", [s["codec_type"] for s in info["streams"]])  # the recording's sound kept
+
+            def near(got, want):
+                return all(abs(g - w) <= 40 for g, w in zip(got, want))
+            green, page_bg = (0, 128, 0), {1: (255, 255, 255), 2: (120, 170, 255), 3: (255, 190, 90)}
+            pip = (640 - 24 - 140, 360 - 24 - 70, 120, 60)       # inside the 160 x 90 PiP, 24 px from the corner
+            for page, t_mid in ((1, 2.0), (2, 6.0), (3, 10.0)):
+                self.assertTrue(near(region_colour(out, t_mid, pip), green), (page, region_colour(out, t_mid, pip)))
+                corner = region_colour(out, t_mid, (560, 10, 60, 30))   # the page's own background, top right
+                self.assertTrue(near(corner, page_bg[page]), (page, corner))
+            for t_mid in (13.0, 16.0):                               # Q&A: the speaker, full frame
+                for box in ((0, 0, 640, 360), (560, 10, 60, 30)):
+                    self.assertTrue(near(region_colour(out, t_mid, box), green), (t_mid, box))
 
 
 if __name__ == "__main__":

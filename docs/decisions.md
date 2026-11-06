@@ -236,3 +236,64 @@ Decided 2026-10-31, checked against ffmpeg-skill v3.0.0 (CHANGELOG "3.0.0", `doc
 ### Evidence
 
 All 56 tests pass locally against ffmpeg-skill v3.0.0 and v2.24.1 (Python 3.11, FFmpeg 6.1.1), including `IntegrationTests.test_inserted_clips_shift_the_slides_and_chapters` (chapters at 0, 4, 6, 10, 11.5 s; every segment's colour).
+
+## ADR-005 Slide-talk layout: one layout and one named rule per segment, as ffmpeg-skill overlay / broll calls
+
+Decided 2026-11-06, checked against ffmpeg-skill v2.24.1 and v3.0.0 (`overlay.py`, `broll.py`).
+
+### Requirements
+
+`ECOSYSTEM_ROADMAP.md` step 7: from `match`, a layout per segment (slide full, the speaker picture-in-picture on the slide, side by side, the speaker full during Q&A), written as a plan for ffmpeg-skill `broll` / `overlay`, with the rule used per segment. Done when a fixture with slides then Q&A gives PiP for the slides and the speaker full for the Q&A.
+
+- **Recorded files only.** The slide recording and the speaker camera are files; nothing here switches live.
+- **Explainable.** Every piece of the recording says which rule chose its layout, in words (`why`), so a wrong frame can be traced to a rule and overridden by an option, not by editing the plan.
+- **ffmpeg-skill does the media work**, as everywhere in this skill; the plan is the list of its calls.
+
+### What ffmpeg-skill offers
+
+| Tool | What it does | Use here |
+|---|---|---|
+| `overlay --video <layer> --place SRC_START-SRC_END@AT ...` (2.13.0 and later) | The layer shown only in the placed ranges, each range of the layer re-timed to start at AT; the main picture untouched outside them; main audio kept | Picture-in-picture and side by side: one call per corner / band size, one `--place` per span |
+| `broll <A> --insert <B> --at --end --from` (repeatable) | B over A for each window, A's timeline and (with `--audio a`) its audio unchanged | Speaker full: one call, one cutaway per span |
+| `grid`, `multicam` | Whole-clip composites / camera switching | Not used: no time ranges (grid), its own sync and switching (multicam) |
+
+There is no ffmpeg-skill tool that shrinks the main picture for part of the video, so a "true" side by side (slide moved left, camera right, both scaled) would need a filter graph built here, which this skill does not do.
+
+### Decision
+
+- **One op, `slide-sync layout <video> --match <json> | --deck <dir> [--camera <video>] ...`.** Without `-o` it prints the plan (`slide-sync/layout@1`; `--plan-out` writes it); with `-o` it also runs the plan. The recording and the camera are probed through ffmpeg-skill `probe` (size, length); nothing else is read.
+- **Layouts:** `slide_full`, `slide_pip`, `side_by_side`, `speaker_full`.
+- **Rules,** first that applies, per piece of a segment (segments are split at `--qa-from` and at the edges of the camera's coverage, so every piece has one layout):
+
+  | Rule | When | Layout |
+  |---|---|---|
+  | `qa_from` | at or after `--qa-from` | speaker full |
+  | `no_deck_page` | no segment of the recording matched any page | speaker full (and a warning) |
+  | `before_first_deck_page` | an unmatched segment before the first matched one (the chair's introduction) | speaker full |
+  | `after_last_deck_page` | an unmatched segment after the last matched one (Q&A on a blank or a slide not in the deck) | speaker full |
+  | `unmatched_speaker` | an unmatched segment between matched ones, with `--unmatched speaker` | speaker full |
+  | `unmatched_mid_talk_kept` | the same without it (default): it may be a demo or a backup slide, which the speaker full frame would hide | the slide layout (PiP) |
+  | `deck_page_side_band` | a matched page whose `view` is `fit` (the page's aspect fitted in the frame) and leaves a free band of at least 12 % of the frame width at each side (`MIN_SIDE_BAND`; a 4:3 deck in a 16:9 capture leaves 12.5 %) | side by side, the camera scaled to the band's width in the right band, centred vertically |
+  | `deck_page` | any other matched page (`--slides auto` or `pip`) | slide PiP |
+  | `deck_page_no_side_band` | `--slides side` on a page with no band | slide PiP |
+  | `slides_full` | `--slides full` | slide full |
+  | `no_camera` | no `--camera` | slide full (the plan has no step) |
+  | `camera_not_covering` | the camera does not cover this time (`--camera-offset`, its length) | slide full |
+
+  A `located` view (a camera on the projection) gives no side band: where the slide sits in the frame is known only as a quadrilateral in match's grid, not to the pixel. `ambiguous` and `below_min_score` are not told apart: either way no page was claimed.
+- **Spans and steps.** Consecutive pieces with one layout become a span. Steps in order: one `overlay` for all PiP spans (`--position <corner> --scale-percent <w>`), one per side-band width (`--position X,Y --margin 0 --scale <band>`), then one `broll` (`--audio a`) for all speaker-full spans. Each step reads the previous one's output; intermediates are `<output>.layout-stepN.<ext>`, refused if they already exist and removed after the run. Camera time is recording time plus `--camera-offset`, in `--place` and `--from`.
+- **Audio.** The recording's, throughout (`overlay` keeps the main audio; `broll --audio a`). The speaker camera's own sound is not used.
+- **Version.** `--place` came in ffmpeg-skill 2.13.0: the plan warns and rendering refuses (`ENGINE_TOOL_MISSING`) on an older one. The contract's range stays `>=2.0.0 <4.0.0` (ADR-004) for the other commands.
+- **Provenance.** The plan is DERIVED from the match (`derived_from`: its path, source, deck, segment and matched counts).
+
+### Evidence
+
+- **Unit (`LayoutUnitTests`).** Every rule above on faked match documents; `--qa-from` splitting a segment; a camera that starts 2 s late and ends early (coverage, offsets in `--place` / `--from`); a 4:3 page pillarboxed in 1920 x 1080 (`side_by_side`, a 240 px band, the 16:9 camera at `1680,472`) against a 16:9 page (PiP); the exact `overlay` / `broll` arguments; rendering in order with intermediates removed, `--overwrite`, an ffmpeg-skill older than 2.13.0 refused; argument refusals; the CLI.
+- **Done-when fixture (`SlideTalkLayoutTests`, real ffmpeg-skill v2.24.1 and v3.0.0).** A three-page PDF imported for real, shown 4 s per page and then 6 s of a blanked projector (Q&A), with sound; a green speaker camera. `layout --deck --camera -o` gives `slide_pip` (`deck_page`) for pages 1 to 3 and `speaker_full` (`after_last_deck_page`) for the Q&A; the output is 18 s with the recording's audio, the PiP corner is the camera's green and the rest of the slide its page colour on every slide, and the whole frame is green in the Q&A. No intermediate file is left.
+
+### Limits
+
+- **Q&A with the last slide still up** looks like the talk: the rules cannot see it. `--qa-from` says when the talk ended.
+- **Sync** is given, not measured (`--camera-offset`).
+- **Side by side** uses only a free band beside a pillarboxed slide; the slide is never moved or shrunk.
+- **Re-encoding.** Each step re-encodes (at ffmpeg-skill's default quality): at most one `overlay` per corner / band and one `broll`.

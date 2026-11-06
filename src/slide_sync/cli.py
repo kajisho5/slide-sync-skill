@@ -7,6 +7,7 @@
   slide-sync import deck.pdf -o pages/ --json            # page PNGs + page text (pptx/key via LibreOffice)
   slide-sync match talk.mp4 --deck pages/ --timeline timeline.json -o match.json   # which page is on screen when
   slide-sync insert talk.mp4 --timeline timeline.json --insert 3=demo.mp4 --insert 5=pages/page-006.png -o talk_demo.mp4
+  slide-sync layout talk.mp4 --match match.json --camera speaker.mp4 --plan-out layout.json -o talk_layout.mp4
   slide-sync contract --json
   slide-sync doctor --json
 
@@ -28,6 +29,8 @@ from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, SlideSyncError, chapters
 from .deck import DEFAULT_DPI, MAX_DPI, MIN_DPI, import_deck, pdfium_status, soffice_status
 from .engine import INSERT_TOOLS, REQUIRED_TOOLS, EngineError, FfmpegSkill, candidates, engine_doctor, locate
 from .insert import DEFAULT_STILL_DURATION, insert_clips, parse_insert
+from .layout import (DEFAULT_PIP_POSITION, DEFAULT_PIP_WIDTH, LAYOUT_TOOLS, PIP_POSITIONS, SLIDE_MODES,
+                     UNMATCHED_MODES, plan_layout, render_layout)
 from .match import DEFAULT_MIN_MARGIN, DEFAULT_MIN_SCORE, DEFAULT_SAMPLES, MAX_SAMPLES, match
 
 
@@ -155,6 +158,36 @@ def cmd_insert(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_layout(a: argparse.Namespace) -> int:
+    for path in (a.plan_out,):  # before the slow part
+        if path and os.path.exists(path) and not a.overwrite:
+            raise SlideSyncError("INVALID_ARGUMENT", f"refusing to overwrite {path}: pass --overwrite")
+    if a.output and os.path.exists(a.output) and not a.overwrite:
+        raise SlideSyncError("INVALID_ARGUMENT", f"refusing to overwrite {a.output}: pass --overwrite")
+    if bool(a.match) == bool(a.deck):
+        raise SlideSyncError("INVALID_ARGUMENT", "give --match (a match JSON) or --deck (to match now), not both")
+    skill = _engine(a.ffmpeg_skill)
+    if a.match:
+        try:
+            with open(a.match, encoding="utf-8") as fh:
+                m = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise SlideSyncError("INVALID_ARGUMENT", f"cannot read {a.match}: {e}")
+    else:
+        m = match(skill, a.video, a.deck, _timeline(a, skill), timeout=a.timeout)
+    plan = plan_layout(skill, a.video, m, camera=a.camera, camera_offset=a.camera_offset, qa_from=a.qa_from,
+                       slides=a.slides, unmatched=a.unmatched, pip_position=a.pip_position, pip_width=a.pip_width,
+                       output=a.output, match_path=a.match, timeout=a.timeout)
+    if a.plan_out:
+        _write_json(a.plan_out, plan, a.overwrite)
+    rendered = render_layout(skill, plan, overwrite=a.overwrite, timeout=a.timeout) if a.output and plan["steps"] else None
+    lines = [f"{p['start']:>9.3f}  {p['end']:>9.3f}  {p['layout']:<13} {p['rule']}" for p in plan["segments"]]
+    lines += [f"step {s['step']}: ffmpeg-skill {s['tool']} - {s['what']}" for s in plan["steps"]]
+    lines += [f"warning: {w}" for w in plan["warnings"]] + ([f"wrote {rendered['output']}"] if rendered else [])
+    _emit(dict(plan, ok=True, plan_file=a.plan_out, rendered=rendered), a.json, "\n".join(lines))
+    return 0
+
+
 def cmd_contract(a: argparse.Namespace) -> int:
     _emit(contract(), True)
     return 0
@@ -189,6 +222,11 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         engine["insert_ready"] = not unusable
         if unusable:
             notes.append("insert: ffmpeg-skill tool(s) not usable: " + ", ".join(unusable))
+        # `layout` renders through overlay / broll (plans need only probe); a missing one is a note as well.
+        lay_missing = [t for t in LAYOUT_TOOLS if t not in skill.tools]
+        engine["layout_ready"] = not lay_missing
+        if lay_missing:
+            notes.append("layout: ffmpeg-skill tool(s) missing: " + ", ".join(lay_missing))
     doc = {"ok": not problems, "skill": "slide-sync-skill", "version": __version__,
            "python": platform.python_version(), "engine": engine, "import": slide_import, "problems": problems, "notes": notes}
     human = "\n".join((["OK"] if not problems else [f"problem: {p}" for p in problems]) + [f"note: {n}" for n in notes])
@@ -279,6 +317,32 @@ def parser() -> argparse.ArgumentParser:
     ins.add_argument("--overwrite", action="store_true")
     common(ins)
     ins.set_defaults(func=cmd_insert)
+
+    lay = sub.add_parser("layout", help="a layout per segment (slide, slide + speaker PiP, side by side, speaker full) "
+                                        "as ffmpeg-skill overlay / broll steps")
+    lay.add_argument("video", help="the slide recording (screen capture or camera on the projection)")
+    lay.add_argument("--match", help="match JSON from `slide-sync match -o`")
+    lay.add_argument("--deck", help="or: an imported deck directory, to match now")
+    lay.add_argument("--timeline", help="with --deck: timeline JSON from `detect -o` (default: detect now)")
+    lay.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="for detect when there is no --timeline")
+    lay.add_argument("--min-dwell", type=float, default=DEFAULT_MIN_DWELL, help="for detect when there is no --timeline")
+    lay.add_argument("--camera", help="the speaker camera, on the recording's clock (see --camera-offset)")
+    lay.add_argument("--camera-offset", type=float, default=0.0,
+                     help="camera time minus recording time, in seconds (default 0: the two start together)")
+    lay.add_argument("--qa-from", type=float, help="from this time of the recording on, the speaker full (Q&A)")
+    lay.add_argument("--slides", choices=SLIDE_MODES, default="auto",
+                     help="layout while a deck page is on screen: auto (side by side when the slide leaves a side band, "
+                          "else PiP), pip, side, full (default auto)")
+    lay.add_argument("--unmatched", choices=UNMATCHED_MODES, default="keep",
+                     help="an unmatched segment between matched pages: keep the slide picture (default) or speaker full")
+    lay.add_argument("--pip-position", choices=PIP_POSITIONS, default=DEFAULT_PIP_POSITION)
+    lay.add_argument("--pip-width", type=float, default=DEFAULT_PIP_WIDTH,
+                     help=f"PiP width, percent of the frame width (default {DEFAULT_PIP_WIDTH:g})")
+    lay.add_argument("--plan-out", help="write the layout plan JSON here")
+    lay.add_argument("-o", "--output", help="render the plan through ffmpeg-skill into this video")
+    lay.add_argument("--overwrite", action="store_true")
+    common(lay)
+    lay.set_defaults(func=cmd_layout)
 
     k = sub.add_parser("contract", help="machine-readable contract")
     k.add_argument("--json", action="store_true")

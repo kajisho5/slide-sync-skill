@@ -9,6 +9,8 @@ from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, TIMELINE_SCHEMA
 from .deck import DECK_SCHEMA, DEFAULT_DPI, ENV_SOFFICE, OFFICE_EXTS, TEXT_NORMALISATION
 from .engine import ENV_DIRS, INSERT_TOOLS, REQUIRED_TOOLS
 from .insert import DEFAULT_STILL_DURATION, STILL_EXTS
+from .layout import (DEFAULT_PIP_POSITION, DEFAULT_PIP_WIDTH, LAYOUT_SCHEMA, LAYOUT_TOOLS, LAYOUTS, MIN_SIDE_BAND, RULES,
+                     SLIDE_MODES, UNMATCHED_MODES)
 from .match import (DEFAULT_MIN_MARGIN, DEFAULT_MIN_SCORE, DEFAULT_SAMPLES, FEAT_H, FEAT_W, FRAME_WIDTH, MATCH_SCHEMA,
                     METHOD)
 
@@ -46,6 +48,15 @@ TOOLS = [
               f"[--still-duration {DEFAULT_STILL_DURATION:g}]", "[--timeline <timeline.json>]", "[--titles <titles.txt>]",
               "[--prefix Slide]", "[--min-chapter <s>]", "[--chapters-out <txt>]", "[--timeline-out <json>]", "-o <video>",
               "[--overwrite]", "--json"]},
+    {"tool_id": "slide-sync/layout", "role": "execution", "writes_media": True, "mutates_input": False, "deterministic": True,
+     "description": "A layout per segment of a slide talk from match (slide full, the speaker camera picture-in-picture "
+                    "on the slide, side by side in the band beside a pillarboxed slide, the speaker full during Q&A), "
+                    "with the rule used per segment, written as a plan of ffmpeg-skill overlay / broll calls "
+                    "(slide-sync/layout@1); with -o the plan is rendered",
+     "argv": ["layout", "<video>", "--match <match.json> | --deck <dir> [--timeline <timeline.json>]", "[--camera <video>]",
+              "[--camera-offset 0]", "[--qa-from <s>]", "[--slides auto|pip|side|full]", "[--unmatched keep|speaker]",
+              f"[--pip-position {DEFAULT_PIP_POSITION}]", f"[--pip-width {DEFAULT_PIP_WIDTH:g}]", "[--plan-out <json>]",
+              "[-o <video>]", "[--overwrite]", "--json"]},
 ]
 
 ERRORS = {
@@ -76,10 +87,11 @@ def contract() -> Dict[str, Any]:
                      {"id": "slides.chapters", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/chapters"},
                      {"id": "slides.import", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/import"},
                      {"id": "slides.match", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/match"},
-                     {"id": "slides.insert_clips", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/insert"}],
+                     {"id": "slides.insert_clips", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/insert"},
+                     {"id": "slides.layout_plan", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/layout"}],
         "dependencies": [{"id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <4.0.0",
-                          "tools": list(REQUIRED_TOOLS) + [t for t in INSERT_TOOLS if t not in REQUIRED_TOOLS],
-                          "tools_for": {"slide-sync/insert": list(INSERT_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
+                          "tools": list(dict.fromkeys(list(REQUIRED_TOOLS) + list(INSERT_TOOLS) + list(LAYOUT_TOOLS))),
+                          "tools_for": {"slide-sync/insert": list(INSERT_TOOLS), "slide-sync/layout": list(LAYOUT_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
                           + ["~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
                          {"id": "pypdfium2", "kind": "python", "required": False, "extra": "pdf", "version_range": ">=4.30",
                           "licence": "Apache-2.0 OR BSD-3-Clause", "for": ["slide-sync/import"]},
@@ -91,8 +103,10 @@ def contract() -> Dict[str, Any]:
         "not_provided": ["slide text from images or scanned pages (OCR: detection-skill)",
                          "matching by slide text (OCR of the frames is detection-skill's; match compares pictures)",
                          "running ffmpeg or ffprobe directly (only through ffmpeg-skill)",
-                         "editing the picture or cutting the talk beyond splicing clips in at slide boundaries "
-                         "(video-editing-skill)", "network access of any kind"],
+                         "editing the picture or cutting the talk beyond splicing clips in at slide boundaries and "
+                         "the slide / speaker layout (video-editing-skill)",
+                         "syncing the speaker camera to the recording (the offset is given; multicam sync is ffmpeg-skill's)",
+                         "live streaming or live switching (recorded files only)", "network access of any kind"],
         "tools": TOOLS,
         "timeline": {"schema": TIMELINE_SCHEMA, "provenance": "OBSERVED"},
         "match": {"schema": MATCH_SCHEMA, "provenance": "OBSERVED", "method": METHOD, "min_score": DEFAULT_MIN_SCORE,
@@ -102,6 +116,10 @@ def contract() -> Dict[str, Any]:
                    "still_extensions": list(STILL_EXTS), "default_still_duration": DEFAULT_STILL_DURATION,
                    "shift": "every segment after an insertion moves later by the clip's measured duration",
                    "records": ["derived_from", "edits", "render"]},
+        "layout": {"schema": LAYOUT_SCHEMA, "provenance": "DERIVED", "layouts": list(LAYOUTS), "rules": dict(RULES),
+                   "slides": list(SLIDE_MODES), "unmatched": list(UNMATCHED_MODES), "min_side_band": MIN_SIDE_BAND,
+                   "steps": "ffmpeg-skill overlay (--video --place) for PiP / side by side, broll for speaker full; "
+                            "overlay --place needs ffmpeg-skill 2.13.0 or later", "audio": "the recording's, throughout"},
         "deck": {"schema": DECK_SCHEMA, "provenance": "OBSERVED", "default_dpi": DEFAULT_DPI,
                  "text_normalisation": TEXT_NORMALISATION},
         "execution": {"canonical_invocation": ["slide-sync", "<command>", "...", "--json"], "network": False, "shell": False,
