@@ -336,3 +336,68 @@ Decided 2026-11-06, checked against ffmpeg-skill v2.24.1 and v3.0.0 (`insert.py`
 - Only what is on the deck page shows: a laser pointer, annotations drawn live, or a video playing inside the slide are gone in a replaced span. Use `--min-confidence 1` (nothing replaced) or keep the capture for such talks; a follow-up could keep segments flagged by detection-skill.
 - Animated builds: a build step matched to the full page shows the full page early.
 - The talk is re-encoded once (broll), plus one short encode per page.
+
+## ADR-007 Slide changes from a recording in progress: whole-prefix passes of ffmpeg-skill scenes, final at min_dwell + 1 s from the readable end
+
+Decided 2026-11-06, checked against ffmpeg-skill v2.24.1 and v3.0.0 (`scenes.py`, `_common/probe.py` `detect_scenes`).
+
+### Requirements
+
+`ECOSYSTEM_ROADMAP.md` step 9: `detect --follow` on a recording still being written emits slide changes as they are found (JSON lines), so the chapters are ready when the recording closes. Done when a fixture appended in bursts yields the same changes as a batch run.
+
+- **Recorded files, not a stream.** The input is a file a recorder is still writing, the same case as ingest-skill's `offload --follow` (its ADR-007). Nothing here reads a live feed.
+- **The same answer as the batch run.** A change reported while recording must be one the finished file has; nothing is guessed early.
+- **Slide-sync side only.** This skill reads the growing file through ffmpeg-skill as it stands. Copying it off the card or recorder as it grows is ingest-skill's.
+
+### How ffmpeg-skill `scenes` decides, and why a prefix gives the same changes
+
+`detect_scenes` scores every frame with scdet against the frame before it. A frame counts as a cut when three things hold: its score is above `--threshold`, it is more than 3 times the median of the +-12 frames around it, and it is the local maximum within +-2 frames. Cuts are then kept greedily, one at least `--min-scene` after the last kept one. At the end, a last cut closer than `--min-scene` to the duration is dropped.
+
+So whether a cut at time t is kept depends on two things only: the frames up to 12 frames after t, and the cuts kept before t. Neither changes when more of the file is written. The one exception is the final drop, which applies only within `--min-scene` of the end. A cut at least `min_dwell` plus 12 frames before the end of the part that could be read is therefore final. This skill uses **min_dwell + 1 s** (12 frames is 0.5 s at 25 fps and 0.2 s at 60 fps).
+
+`scenes` has no seek, and a window cut out through ffmpeg-skill `cut` would re-encode, or snap to a keyframe, and so change the scores. Each pass therefore reads the whole file as written so far. That costs one more read of the written part per pass. Passes run only when the file has grown, at most once per `--poll` (default 5 s).
+
+### What can be read while it grows
+
+Measured with ffmpeg-skill `scenes` / `probe` on the first 55 % of a file:
+
+| Container as written while recording | Readable length | Result |
+|---|---|---|
+| MPEG-TS (`.ts`, `.m2ts`, `.mts`) | yes (11.0 s of 20) | changes as they come |
+| Matroska written to a pipe (no duration element yet) | none | `waiting`: changes come at close |
+| Matroska with its duration already written (a copy of a finished file) | the full length, wrong | not a growing file; the final pass is right |
+| Fragmented MP4 (`empty_moov`) | ffprobe fails to read the header | `waiting` until it can be read |
+
+A pass that ffmpeg-skill cannot read emits `waiting` once and is retried when the file grows. A pass with no measurable length reports nothing. The batch `detect` at close always runs.
+
+### Decision
+
+- **`slide-sync detect <video> --follow [--settle 30] [--poll 5] [--follow-for T] [--chapters-out txt] [-o timeline.json] --json`.** Same `--threshold` / `--min-dwell` as the batch run.
+- **Events,** one JSON object per line:
+  - `start`: the settings and the guard.
+  - `pass`: size, the readable length, and "final up to".
+  - `waiting`
+  - `change`: `slide`, `time`, and `while_recording` (true when found during a pass, false when found only at close).
+  - `retract`
+  - `done`: `closed`, and the timeline.
+- **Closed** means the file's size and mtime have been unchanged for `--settle` seconds (30 by default, as in ingest-skill). Whether the recorder still holds the file open is not detected, because there is no portable way to do it. Then one batch `detect` of the whole file gives the timeline, with a `follow` block: passes, how many changes were reported while recording and how many at close, and any retracted. Changes it has that were not reported yet are emitted then. A change reported earlier that it does not have is `retract`ed, never silently dropped.
+- **`--follow-for T`** stops after T seconds even if the file still grows. The timeline then carries a warning that the recording may still be going.
+- **Chapters ready at close.** `--chapters-out` is rewritten after every change (`Slide N` titles, written to a temporary file and renamed, so a reader never sees half of it) and once more from the final timeline. `-o` writes that timeline. Both refuse an existing file before the follow starts, unless `--overwrite` is given. `--sheet` is refused with `--follow`.
+
+### Evidence
+
+- **Unit (`FollowUnitTests`).** A file that grows by one burst per tick under a fake clock, with `scenes` faked to behave like the real one on a prefix:
+  - every change reported while recording, and the same as the batch run;
+  - a change within the guard of the end reported only at close;
+  - a spurious cut seen in one pass retracted;
+  - `--follow-for` before the file settles;
+  - a file that never appears;
+  - the guard rule itself;
+  - the CLI's JSON lines, its chapter file and its timeline file.
+- **Done-when fixture (`FollowIntegrationTests`, real ffmpeg-skill v2.24.1 / v3.0.0).** A 22 s MPEG-TS recording (six slides, sound) is appended to its file in ten bursts, 0.7 s apart, cut at arbitrary byte offsets. `detect --follow --poll 0.3 --settle 2.5` runs alongside. Its changes (4, 7, 12, 15, 19 s) equal the batch `detect` of the finished file, and the slides of its final timeline equal the batch slides. All five changes were emitted during passes, each once its time was 3 s clear of the readable end (the test requires at least three). Nothing was retracted, and the chapter file equals `chapters` of the batch timeline.
+
+### Limits
+
+- **Cost.** Every pass reads the whole written part. On a long recording, a larger `--poll` (or fewer passes) keeps it to a fraction of real time. The final pass is a full `detect`.
+- **Containers.** Only those whose length ffmpeg-skill can measure while growing (MPEG-TS) report changes during recording. Others report them at close.
+- **Sheet and match** are not run while recording: they are run on the closed file.

@@ -10,7 +10,9 @@ integration test splices generated clips into a generated talk with the real ffm
 layouts to faked match documents; the layout integration test (slides then Q&A) matches and renders a generated talk
 with a generated speaker camera through the real ffmpeg-skill overlay / broll. Clean unit tests decide replace / keep
 on faked match documents; the clean integration test puts the deck pages over a soft, keystoned camera shot of the
-projection with the real ffmpeg-skill insert / broll and measures sharpness.
+projection with the real ffmpeg-skill insert / broll and measures sharpness. Follow unit tests grow a file under a fake
+clock with ffmpeg-skill faked; the follow integration test appends a real MPEG-TS recording in bursts while
+`detect --follow` runs and compares its changes with a batch run.
 
     python -m unittest -v tests/test_slide_sync.py
 """
@@ -47,6 +49,7 @@ from slide_sync import match as match_mod  # noqa: E402
 from slide_sync.match import MATCH_SCHEMA, decide, match, quad_sampler, read_png, sample_times, slide_quad  # noqa: E402
 from slide_sync.layout import LAYOUT_SCHEMA, assign, plan_layout, render_layout, side_band, spans_of  # noqa: E402
 from slide_sync.clean import CLEAN_SCHEMA, decide_segments, page_size, plan_clean, replaced_spans  # noqa: E402
+from slide_sync.follow import confirmed, follow, guard_for  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -718,6 +721,135 @@ class CleanUnitTests(unittest.TestCase):
         self.assertEqual(doc["rendered"]["output"], os.path.join(self.tmp, "o.mp4"))
         with redirect_stdout(io.StringIO()), mock.patch.object(cli, "_engine", return_value=self.SKILL):
             self.assertEqual(cli.main(["clean", self.video, "--json"]), 2)
+
+
+# ------------------------------------------------------------------ detect --follow (roadmap step 9)
+
+class GrowingRecording:
+    """A file that grows by one burst per sleep, a fake clock, and a fake ffmpeg-skill `scenes` that answers like the
+    real one on the part written so far: cuts at most `readable`, a last cut closer than --min-scene to the end
+    dropped. Once every burst is written the file is complete and answers with its full length."""
+
+    def __init__(self, path, cuts, duration, readable_steps, extra=None):
+        self.path, self.cuts, self.duration = path, cuts, duration
+        self.steps = list(readable_steps)
+        self.readable = 0.0
+        self.now = 0.0
+        self.extra = extra or {}   # readable -> a spurious cut seen only at that length
+        self.calls = []
+        Path(path).write_bytes(b"")
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, dt):
+        self.now += dt
+        if self.steps:
+            self.readable = self.steps.pop(0)
+            with open(self.path, "ab") as fh:
+                fh.write(b"x" * 188)
+
+    def __call__(self, argv, timeout):
+        tool, args = Path(argv[1]).stem, argv[2:]
+        self.calls.append((tool, self.readable))
+        if self.readable <= 0:
+            return 1, "", "error: ffprobe failed: no header yet"
+        min_scene = float(args[args.index("--min-scene") + 1])
+        dur = self.readable if self.steps else self.duration
+        cuts = [0.0] + [c for c in self.cuts if c <= dur] + ([self.extra[self.readable]] if self.readable in self.extra
+                                                             and self.steps else [])
+        cuts = sorted(cuts)
+        if len(cuts) > 1 and dur - cuts[-1] < min_scene:
+            cuts.pop()
+        bounds = list(zip(cuts, cuts[1:] + [dur]))
+        return 0, json.dumps(scenes_doc(bounds, dur)), ""
+
+
+class FollowUnitTests(unittest.TestCase):
+    SKILL = FfmpegSkill("/fake/ffmpeg-skill", "3.0.0", ["look", "metadata", "probe", "scenes"])
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "rec.ts")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def run_follow(self, rec, **kw):
+        events = []
+        kw.setdefault("settle", 3.0)
+        kw.setdefault("poll", 1.0)
+        tl = follow(self.SKILL, self.path, events.append, min_dwell=2.0, runner=rec, clock=rec.clock, sleep=rec.sleep, **kw)
+        return tl, events
+
+    def test_changes_are_reported_while_recording_and_match_the_batch_run(self):
+        rec = GrowingRecording(self.path, [4.0, 8.0, 12.0, 16.0], 20.0, [0, 3, 6, 9, 12, 15, 18, 20])
+        tl, events = self.run_follow(rec)
+        changes = [e for e in events if e["event"] == "change"]
+        self.assertEqual([e["time"] for e in changes], [4.0, 8.0, 12.0, 16.0])
+        self.assertEqual([e["slide"] for e in changes], [2, 3, 4, 5])
+        self.assertEqual(tl["changes"], [4.0, 8.0, 12.0, 16.0])          # the batch detect at close
+        # each change once it is min_dwell + 1 s clear of what could be read: 4 at 9 s readable, ..., 16 at 20 s
+        self.assertEqual([e["while_recording"] for e in changes], [True, True, True, True])
+        self.assertEqual([e["event"] for e in events][0], "start")
+        self.assertEqual(events[-1]["event"], "done")
+        self.assertTrue(events[-1]["closed"])
+        self.assertEqual(tl["follow"]["retracted"], [])
+        self.assertEqual(tl["follow"]["reported_while_recording"], 4)
+        self.assertIn("waiting", [e["event"] for e in events])          # the empty file at first
+
+    def test_a_change_near_the_end_waits_for_the_close(self):
+        rec = GrowingRecording(self.path, [4.0, 17.5], 20.0, [6, 12, 19])
+        tl, events = self.run_follow(rec)
+        changes = [(e["time"], e["while_recording"]) for e in events if e["event"] == "change"]
+        self.assertEqual(changes, [(4.0, True), (17.5, False)])
+        self.assertEqual(tl["changes"], [4.0, 17.5])
+
+    def test_a_reported_change_the_whole_file_does_not_have_is_retracted(self):
+        rec = GrowingRecording(self.path, [4.0], 20.0, [8, 14, 20], extra={14: 9.0})
+        tl, events = self.run_follow(rec)
+        self.assertEqual([e["time"] for e in events if e["event"] == "retract"], [9.0])
+        self.assertEqual(tl["follow"]["retracted"], [9.0])
+        self.assertEqual(tl["changes"], [4.0])
+
+    def test_follow_for_stops_before_the_file_settles(self):
+        rec = GrowingRecording(self.path, [4.0], 60.0, list(range(1, 61)))
+        tl, events = self.run_follow(rec, follow_for=10.0)
+        self.assertFalse(tl["follow"]["closed"])
+        self.assertTrue(any("ran out" in w for w in tl["warnings"]))
+        with self.assertRaises(SlideSyncError):
+            follow(self.SKILL, os.path.join(self.tmp, "never.ts"), lambda e: None, settle=2, poll=1,
+                   runner=rec, clock=rec.clock, sleep=rec.sleep)
+
+    def test_guard_and_confirmed(self):
+        self.assertEqual(guard_for(2.0), 3.0)
+        doc = scenes_doc([(0, 4), (4, 8), (8, 9.5)], 9.5)
+        self.assertEqual(confirmed(doc, 3.0), [4.0])
+        self.assertEqual(confirmed({"duration": None, "scenes": []}, 3.0), [])
+        for kw in ({"settle": 0}, {"poll": -1}, {"follow_for": 0}, {"min_dwell": 0}):
+            with self.assertRaises(SlideSyncError):
+                follow(self.SKILL, self.path, lambda e: None, **kw)
+
+    def test_cli_prints_json_lines_and_keeps_the_chapters(self):
+        rec = GrowingRecording(self.path, [4.0, 8.0], 12.0, [3, 7, 10, 12])
+        chapters_file, tl_file = os.path.join(self.tmp, "ch.txt"), os.path.join(self.tmp, "tl.json")
+        real = follow
+
+        def fake_follow(skill, video, emit, **kw):
+            return real(skill, video, emit, threshold=kw["threshold"], min_dwell=kw["min_dwell"], settle=3, poll=1,
+                        runner=rec, clock=rec.clock, sleep=rec.sleep)
+        buf = io.StringIO()
+        with mock.patch.object(cli, "_engine", return_value=self.SKILL), mock.patch.object(cli, "follow", fake_follow), \
+                redirect_stdout(buf):
+            rc = cli.main(["detect", self.path, "--follow", "--json", "--chapters-out", chapters_file, "-o", tl_file])
+        lines = [json.loads(x) for x in buf.getvalue().splitlines()]
+        self.assertEqual(rc, 0)
+        self.assertEqual([x["time"] for x in lines if x["event"] == "change"], [4.0, 8.0])
+        self.assertEqual(Path(chapters_file).read_text(encoding="utf-8"), "0:00 Slide 1\n0:04 Slide 2\n0:08 Slide 3\n")
+        self.assertEqual(json.loads(Path(tl_file).read_text(encoding="utf-8"))["changes"], [4.0, 8.0])
+        with redirect_stdout(io.StringIO()), mock.patch.object(cli, "_engine", return_value=self.SKILL):
+            self.assertEqual(cli.main(["detect", self.path, "--follow", "--sheet", "s.png", "--json"]), 2)
+            self.assertEqual(cli.main(["detect", self.path, "--follow", "-o", tl_file, "--json"]), 2)  # exists
 
 
 # ------------------------------------------------------------------ slide import fixtures (built at test time)
@@ -1661,6 +1793,63 @@ class CleanPagesTests(unittest.TestCase):
                 a, b = frame_grey(cam, t_mid, size), frame_grey(out, t_mid, size)
                 diff = sum(abs(x - y) for ra, rb in zip(a, b) for x, y in zip(ra[::4], rb[::4])) / (len(a) * len(a[0]) / 4)
                 self.assertLess(diff, 4.0, t_mid)
+
+
+@unittest.skipUnless(ENGINE and shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg-skill and ffmpeg")
+class FollowIntegrationTests(unittest.TestCase):
+    """Roadmap step 9's done-when fixture: an MPEG-TS slide recording appended to its file in bursts (as a recorder
+    writes it) while `detect --follow` runs with the real ffmpeg-skill; its changes equal a batch `detect`."""
+
+    def test_a_recording_appended_in_bursts_yields_the_batch_changes(self):
+        import threading
+        with tempfile.TemporaryDirectory() as t:
+            parts = []
+            for i, (colour, seconds) in enumerate([("white", 4), ("red", 3), ("blue", 5), ("green", 3), ("yellow", 4),
+                                                   ("navy", 3)]):
+                part = os.path.join(t, f"p{i}.mp4")
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s=320x180:d={seconds}:r=25",
+                                "-pix_fmt", "yuv420p", part], check=True)
+                parts.append(part)
+            lst = os.path.join(t, "parts.txt")
+            Path(lst).write_text("".join(f"file '{p}'\n" for p in parts), encoding="utf-8")
+            done, growing = os.path.join(t, "done.ts"), os.path.join(t, "growing.ts")
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-f", "lavfi", "-i",
+                            "sine=f=330:d=22", "-c:v", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                            "-f", "mpegts", done], check=True)
+            batch = detect(ENGINE, done, min_dwell=2)
+            data = Path(done).read_bytes()
+            Path(growing).write_bytes(b"")
+            bursts = 10
+
+            def record():   # ten bursts, 0.7 s apart, cut anywhere (not on packet boundaries)
+                with open(growing, "ab") as fh:
+                    for k in range(bursts):
+                        fh.write(data[len(data) * k // bursts:len(data) * (k + 1) // bursts])
+                        fh.flush()
+                        threading.Event().wait(0.7)
+            writer = threading.Thread(target=record)
+            chapters_file, tl_file = os.path.join(t, "chapters.txt"), os.path.join(t, "timeline.json")
+            buf = io.StringIO()
+            writer.start()
+            try:
+                with redirect_stdout(buf):
+                    rc = cli.main(["detect", growing, "--follow", "--min-dwell", "2", "--poll", "0.3", "--settle", "2.5",
+                                   "--chapters-out", chapters_file, "-o", tl_file, "--json", "--ffmpeg-skill", ENGINE.root])
+            finally:
+                writer.join()
+            events = [json.loads(x) for x in buf.getvalue().splitlines()]
+            self.assertEqual(rc, 0)
+            changes = [e for e in events if e["event"] == "change"]
+            self.assertEqual([e["time"] for e in changes], batch["changes"])
+            self.assertEqual(len(batch["changes"]), 5)
+            self.assertGreaterEqual(sum(e["while_recording"] for e in changes), 3, events)  # found while it grew
+            self.assertEqual([e for e in events if e["event"] == "retract"], [])
+            done_ev = events[-1]
+            self.assertEqual((done_ev["event"], done_ev["closed"]), ("done", True))
+            self.assertEqual([(s["start"], s["end"]) for s in done_ev["timeline"]["slides"]],
+                             [(s["start"], s["end"]) for s in batch["slides"]])
+            self.assertEqual(Path(chapters_file).read_text(encoding="utf-8"), chapters(batch)["text"])
+            self.assertEqual(json.loads(Path(tl_file).read_text(encoding="utf-8"))["changes"], batch["changes"])
 
 
 if __name__ == "__main__":

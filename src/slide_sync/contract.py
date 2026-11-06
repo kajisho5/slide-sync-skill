@@ -8,6 +8,7 @@ from . import __version__
 from .clean import CLEAN_SCHEMA, CLEAN_TOOLS, DEFAULT_MIN_CONFIDENCE
 from .clean import RULES as CLEAN_RULES
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, TIMELINE_SCHEMA
+from .follow import DEFAULT_POLL, DEFAULT_SETTLE, GUARD_EXTRA
 from .deck import DECK_SCHEMA, DEFAULT_DPI, ENV_SOFFICE, OFFICE_EXTS, TEXT_NORMALISATION
 from .engine import ENV_DIRS, INSERT_TOOLS, REQUIRED_TOOLS
 from .insert import DEFAULT_STILL_DURATION, STILL_EXTS
@@ -21,9 +22,12 @@ CONTRACT_VERSION = "1.0"
 
 TOOLS = [
     {"tool_id": "slide-sync/detect", "role": "measurement", "writes_media": False, "mutates_input": False, "deterministic": True,
-     "description": "Slide changes of a talk recording: one entry per slide (start, end, duration), from ffmpeg-skill scenes",
+     "description": "Slide changes of a talk recording: one entry per slide (start, end, duration), from ffmpeg-skill scenes. "
+                    "With --follow, of a recording still being written: slide changes as JSON lines as they are found, "
+                    "then the timeline once the file has settled",
      "argv": ["detect", "<video>", f"[--threshold {DEFAULT_THRESHOLD:g}]", f"[--min-dwell {DEFAULT_MIN_DWELL:g}]", "[--sheet <png>]",
-              "[-o <timeline.json>]", "--json"]},
+              "[-o <timeline.json>]", "[--chapters-out <txt>]", "[--follow]", f"[--settle {DEFAULT_SETTLE:g}]",
+              f"[--poll {DEFAULT_POLL:g}]", "[--follow-for <s>]", "--json"]},
     {"tool_id": "slide-sync/chapters", "role": "execution", "writes_media": True, "mutates_input": False, "deterministic": True,
      "description": "Chapters from a slide timeline: chapter text (YouTube description format) and, with -o, a copy of the "
                     "video carrying them as container chapters (ffmpeg-skill metadata, streams copied)",
@@ -121,6 +125,12 @@ def contract() -> Dict[str, Any]:
                          "live streaming or live switching (recorded files only)", "network access of any kind"],
         "tools": TOOLS,
         "timeline": {"schema": TIMELINE_SCHEMA, "provenance": "OBSERVED"},
+        "follow": {"output": "JSON lines: start, pass, waiting, change, retract, done (done carries the timeline)",
+                   "settle": DEFAULT_SETTLE, "poll": DEFAULT_POLL,
+                   "final_when": f"at least min_dwell + {GUARD_EXTRA:g}s before the end of what could be read",
+                   "closed_when": "the file's size and mtime unchanged for --settle seconds",
+                   "readable_while_growing": "containers whose length ffmpeg-skill probe measures as they grow (MPEG-TS: "
+                                             ".ts, .m2ts, .mts); others report their changes when they close"},
         "match": {"schema": MATCH_SCHEMA, "provenance": "OBSERVED", "method": METHOD, "min_score": DEFAULT_MIN_SCORE,
                   "min_margin": DEFAULT_MIN_MARGIN, "samples": DEFAULT_SAMPLES, "frame_width": FRAME_WIDTH,
                   "feature": [FEAT_W, FEAT_H], "unmatched": "page null with reason below_min_score or ambiguous"},
