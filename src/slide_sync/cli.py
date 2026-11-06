@@ -2,6 +2,7 @@
 
   slide-sync detect talk.mp4 --json                      # slide timeline
   slide-sync detect talk.mp4 --sheet sheet.png -o timeline.json
+  slide-sync detect recording.ts --follow --json --chapters-out chapters.txt -o timeline.json   # while it records
   slide-sync chapters talk.mp4 --timeline timeline.json --chapters-out chapters.txt
   slide-sync chapters talk.mp4 --titles titles.txt --min-chapter 10 -o talk_chapters.mp4
   slide-sync import deck.pdf -o pages/ --json            # page PNGs + page text (pptx/key via LibreOffice)
@@ -27,7 +28,9 @@ from typing import Any, Dict, List, Optional
 from . import __version__
 from .contract import ERRORS, contract
 from .clean import CLEAN_TOOLS, DEFAULT_MIN_CONFIDENCE, plan_clean
-from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, SlideSyncError, chapters, detect, read_titles, write_chapters
+from .core import (DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, SlideSyncError, chapters, detect, read_titles, timecode,
+                   write_chapters)
+from .follow import DEFAULT_POLL, DEFAULT_SETTLE, follow
 from .deck import DEFAULT_DPI, MAX_DPI, MIN_DPI, import_deck, pdfium_status, soffice_status
 from .engine import INSERT_TOOLS, REQUIRED_TOOLS, EngineError, FfmpegSkill, candidates, engine_doctor, locate
 from .insert import DEFAULT_STILL_DURATION, insert_clips, parse_insert
@@ -71,11 +74,59 @@ def _write_json(path: str, doc: Dict[str, Any], overwrite: bool) -> None:
         fh.write("\n")
 
 
+def _write_text(path: str, text: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)   # a reader never sees half a file
+
+
+def cmd_follow(a: argparse.Namespace) -> int:
+    for path in (a.output, a.chapters_out):  # before the recording is followed
+        if path and os.path.exists(path) and not a.overwrite:
+            raise SlideSyncError("INVALID_ARGUMENT", f"refusing to overwrite {path}: pass --overwrite")
+    if a.sheet:
+        raise SlideSyncError("INVALID_ARGUMENT", "--sheet is not available with --follow: run detect --sheet once it closed")
+    skill = _engine(a.ffmpeg_skill)
+    changes: List[float] = []
+
+    def emit(ev: Dict[str, Any]) -> None:
+        if ev["event"] == "change":
+            changes.append(ev["time"])
+        elif ev["event"] == "retract":
+            changes.remove(ev["time"])
+        if a.chapters_out and ev["event"] in ("change", "retract"):
+            starts = [0.0] + sorted(changes)
+            _write_text(a.chapters_out, "".join(f"{timecode(t)} Slide {i + 1}\n" for i, t in enumerate(starts)))
+        if a.json:
+            print(json.dumps(ev, ensure_ascii=False), flush=True)
+        elif ev["event"] == "change":
+            print(f"slide {ev['slide']:>3} at {ev['time']:>9.3f}s" + ("" if ev["while_recording"] else " (at close)"), flush=True)
+        elif ev["event"] in ("waiting", "retract"):
+            print(f"{ev['event']}: {ev.get('reason')}", flush=True)
+        elif ev["event"] == "done":
+            print(f"{'closed' if ev['closed'] else 'stopped'}: {ev['timeline']['slide_count']} slide(s)", flush=True)
+
+    tl = follow(skill, a.video, emit, threshold=a.threshold, min_dwell=a.min_dwell, settle=a.settle, poll=a.poll,
+                follow_for=a.follow_for, timeout=a.timeout)
+    if a.chapters_out:
+        _write_text(a.chapters_out, chapters(tl)["text"])
+    if a.output:
+        _write_json(a.output, tl, True)
+    return 0
+
+
 def cmd_detect(a: argparse.Namespace) -> int:
+    if a.follow:
+        return cmd_follow(a)
     skill = _engine(a.ffmpeg_skill)
     tl = detect(skill, a.video, threshold=a.threshold, min_dwell=a.min_dwell, sheet=a.sheet, timeout=a.timeout)
     if a.output:
         _write_json(a.output, tl, a.overwrite)
+    if a.chapters_out:
+        if os.path.exists(a.chapters_out) and not a.overwrite:
+            raise SlideSyncError("INVALID_ARGUMENT", f"refusing to overwrite {a.chapters_out}: pass --overwrite")
+        _write_text(a.chapters_out, chapters(tl)["text"])
     lines = [f"{tl['slide_count']} slide(s) over {tl['source']['duration']:.1f}s"]
     lines += [f"  {s['index']:>3}  {s['start']:>9.3f}  {s['duration']:>8.3f}s" for s in tl["slides"]]
     _emit(dict(tl, ok=True, timeline_file=a.output), a.json, "\n".join(lines))
@@ -284,6 +335,15 @@ def parser() -> argparse.ArgumentParser:
     d.add_argument("--min-dwell", type=float, default=DEFAULT_MIN_DWELL, help=f"seconds a slide must stay (default {DEFAULT_MIN_DWELL:g})")
     d.add_argument("--sheet", help="also write a contact sheet PNG, one thumbnail per slide")
     d.add_argument("-o", "--output", help="also write the timeline JSON here")
+    d.add_argument("--follow", action="store_true",
+                   help="the recording is still being written: report slide changes as they are found (JSON lines with "
+                        "--json) until the file has not changed for --settle seconds")
+    d.add_argument("--settle", type=float, default=DEFAULT_SETTLE,
+                   help=f"with --follow: seconds unchanged before the recording counts as closed (default {DEFAULT_SETTLE:g})")
+    d.add_argument("--poll", type=float, default=DEFAULT_POLL,
+                   help=f"with --follow: seconds between looks at the file (default {DEFAULT_POLL:g})")
+    d.add_argument("--follow-for", type=float, help="with --follow: stop after this many seconds even if it still grows")
+    d.add_argument("--chapters-out", help="also write chapter text (Slide N) here; with --follow it is updated at every change")
     d.add_argument("--overwrite", action="store_true")
     common(d)
     d.set_defaults(func=cmd_detect)

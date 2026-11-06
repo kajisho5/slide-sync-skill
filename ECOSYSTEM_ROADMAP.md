@@ -5,7 +5,7 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 
 ## Where it stands
 
-0.1.0: `detect` (slide timeline from ffmpeg-skill scenes, min-dwell filter, contact sheet) and `chapters` (chapter text, container chapters through ffmpeg-skill metadata), with contract and doctor. Stdlib only; unit tests plus integration tests on the real engine.
+0.1.0: `detect` (slide timeline from ffmpeg-skill scenes, min-dwell filter, contact sheet; since step 9 also `--follow` on a recording still being written) and `chapters` (chapter text, container chapters through ffmpeg-skill metadata), with contract and doctor. Stdlib only; unit tests plus integration tests on the real engine.
 Since then: `import` (deck -> per-page PNG + text; pypdfium2 as the optional `pdf` extra, LibreOffice for PPTX / KEY; ADR-001 in `docs/decisions.md`) and `match` (each detected slide -> deck page, confidence, or null; image correlation with a located, de-keystoned slide, standard library; ADR-002) and `insert` (clips spliced in at slide boundaries through ffmpeg-skill cut / insert / join, the timeline and chapters shifted by the clips' measured lengths, provenance DERIVED; ADR-003) and `layout` (a layout per segment from `match` and a speaker camera, with the rule that chose it, as ffmpeg-skill `overlay` / `broll` calls, rendered with `-o`; ADR-005) and `clean` (the deck page, sharp, over the captured slide where `match` is confident, through ffmpeg-skill `insert` / `broll`; ADR-006).
 
 ## What this repository owns
@@ -42,9 +42,10 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` 
   - なぜ要るか：プロジェクターを撮った眠いスライドを、元の資料の鮮明な画に差し替えられる
   - Done when: a fixture's replaced frames have higher sharpness than the capture, and an unmatched span is left as captured
   - Done (ADR-006): `slide-sync clean` ([#14](https://github.com/kajisho5/slide-sync-skill/pull/14)) decides `replace` / `keep` per segment with the rule (`confident_match` at 0.8 or more with frames that agree; `low_confidence`, `mixed`, `unmatched` keep the capture) as `slide-sync/clean@1`; each replaced page becomes a still clip at the recording's frame size (ffmpeg-skill `insert`, aspect kept) and one `broll` puts the clips over their spans, keeping the recording's sound. `CleanPagesTests` (three imported pages and a slide not in the deck, filmed by a soft, keystoned, noisy simulated camera; real ffmpeg-skill v2.24.1 / v3.0.0 in CI): replaced frames are 3 to 4 times as sharp as the capture (Laplacian variance at half resolution), the unmatched span is left as captured (under 4 grey levels mean difference)
-- [ ] **9. Slide changes from a recording in progress** — `detect --follow` on a recording still being written emits slide changes as they are found (JSON lines), so the chapters are ready when the recording closes
+- [x] **9. Slide changes from a recording in progress** — `detect --follow` on a recording still being written emits slide changes as they are found (JSON lines), so the chapters are ready when the recording closes
   - なぜ要るか：収録中に章立てを進め、終演直後に章付きアーカイブを出せる
   - Done when: a fixture appended in bursts yields the same changes as a batch run
+  - Done (ADR-007): `slide-sync detect --follow [--settle 30] [--poll 5] [--follow-for T] [--chapters-out txt]` ([#15](https://github.com/kajisho5/slide-sync-skill/pull/15)) reads the growing file through ffmpeg-skill `scenes` as it stands, pass by pass, and emits a change as a JSON line once it is `min_dwell` + 1 s clear of the readable end (where `scenes` can no longer change it); after `--settle` s unchanged one batch `detect` gives the timeline (late changes emitted, any wrong early one retracted) and `--chapters-out`, rewritten at every change, is final. `FollowIntegrationTests` (a 22 s MPEG-TS recording appended in ten bursts; real ffmpeg-skill v2.24.1 / v3.0.0 in CI) yields the batch run's five changes, all reported by passes before the file settled. Changes come while recording only for MPEG-TS; MKV / MP4 written live report at close. Copying the growing file off the recorder is ingest-skill's `offload --follow` (its step 8)
 
 ## Boundaries
 
