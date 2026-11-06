@@ -8,6 +8,7 @@
   slide-sync match talk.mp4 --deck pages/ --timeline timeline.json -o match.json   # which page is on screen when
   slide-sync insert talk.mp4 --timeline timeline.json --insert 3=demo.mp4 --insert 5=pages/page-006.png -o talk_demo.mp4
   slide-sync layout talk.mp4 --match match.json --camera speaker.mp4 --plan-out layout.json -o talk_layout.mp4
+  slide-sync clean camera.mp4 --match match.json --plan-out clean.json -o camera_clean.mp4   # deck pages over the capture
   slide-sync contract --json
   slide-sync doctor --json
 
@@ -25,6 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from . import __version__
 from .contract import ERRORS, contract
+from .clean import CLEAN_TOOLS, DEFAULT_MIN_CONFIDENCE, plan_clean
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, SlideSyncError, chapters, detect, read_titles, write_chapters
 from .deck import DEFAULT_DPI, MAX_DPI, MIN_DPI, import_deck, pdfium_status, soffice_status
 from .engine import INSERT_TOOLS, REQUIRED_TOOLS, EngineError, FfmpegSkill, candidates, engine_doctor, locate
@@ -188,6 +190,34 @@ def cmd_layout(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clean(a: argparse.Namespace) -> int:
+    for path in (a.plan_out, a.output):  # before the slow part
+        if path and os.path.exists(path) and not a.overwrite:
+            raise SlideSyncError("INVALID_ARGUMENT", f"refusing to overwrite {path}: pass --overwrite")
+    if not a.match and not a.deck:
+        raise SlideSyncError("INVALID_ARGUMENT", "give --match (a match JSON) or --deck (to match now)")
+    skill = _engine(a.ffmpeg_skill)
+    if a.match:
+        try:
+            with open(a.match, encoding="utf-8") as fh:
+                m = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise SlideSyncError("INVALID_ARGUMENT", f"cannot read {a.match}: {e}")
+    else:
+        m = match(skill, a.video, a.deck, _timeline(a, skill), timeout=a.timeout)
+    plan = plan_clean(skill, a.video, m, deck_dir=a.deck, min_confidence=a.min_confidence, pad_color=a.pad_color,
+                      output=a.output, match_path=a.match, timeout=a.timeout)
+    if a.plan_out:
+        _write_json(a.plan_out, plan, a.overwrite)
+    rendered = render_layout(skill, plan, overwrite=a.overwrite, timeout=a.timeout) if a.output and plan["steps"] else None
+    lines = [f"{d['start']:>9.3f}  {d['end']:>9.3f}  {d['action']:<8} {d['rule']}"
+             + (f" (page {d['page']}, {d['confidence']:.3f})" if d["page"] is not None else "") for d in plan["segments"]]
+    lines += [f"step {s['step']}: ffmpeg-skill {s['tool']} - {s['what']}" for s in plan["steps"]]
+    lines += [f"warning: {w}" for w in plan["warnings"]] + ([f"wrote {rendered['output']}"] if rendered else [])
+    _emit(dict(plan, ok=True, plan_file=a.plan_out, rendered=rendered), a.json, "\n".join(lines))
+    return 0
+
+
 def cmd_contract(a: argparse.Namespace) -> int:
     _emit(contract(), True)
     return 0
@@ -227,6 +257,10 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         engine["layout_ready"] = not lay_missing
         if lay_missing:
             notes.append("layout: ffmpeg-skill tool(s) missing: " + ", ".join(lay_missing))
+        clean_missing = [t for t in CLEAN_TOOLS if t not in skill.tools]
+        engine["clean_ready"] = not clean_missing
+        if clean_missing:
+            notes.append("clean: ffmpeg-skill tool(s) missing: " + ", ".join(clean_missing))
     doc = {"ok": not problems, "skill": "slide-sync-skill", "version": __version__,
            "python": platform.python_version(), "engine": engine, "import": slide_import, "problems": problems, "notes": notes}
     human = "\n".join((["OK"] if not problems else [f"problem: {p}" for p in problems]) + [f"note: {n}" for n in notes])
@@ -343,6 +377,23 @@ def parser() -> argparse.ArgumentParser:
     lay.add_argument("--overwrite", action="store_true")
     common(lay)
     lay.set_defaults(func=cmd_layout)
+
+    cl = sub.add_parser("clean", help="the deck page, sharp, over the captured slide where match is confident")
+    cl.add_argument("video", help="the slide recording (a camera on the projection, or a soft screen capture)")
+    cl.add_argument("--match", help="match JSON from `slide-sync match -o`")
+    cl.add_argument("--deck", help="the imported deck directory (default: the one the match names); without --match, "
+                                   "match now with it")
+    cl.add_argument("--timeline", help="without --match: timeline JSON from `detect -o` (default: detect now)")
+    cl.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="for detect when there is no --timeline")
+    cl.add_argument("--min-dwell", type=float, default=DEFAULT_MIN_DWELL, help="for detect when there is no --timeline")
+    cl.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE,
+                    help=f"replace only segments matched at least this confidently (default {DEFAULT_MIN_CONFIDENCE:g})")
+    cl.add_argument("--pad-color", default="black", help="bars around a page of another aspect (default black)")
+    cl.add_argument("--plan-out", help="write the plan JSON here")
+    cl.add_argument("-o", "--output", help="render the plan through ffmpeg-skill into this video")
+    cl.add_argument("--overwrite", action="store_true")
+    common(cl)
+    cl.set_defaults(func=cmd_clean)
 
     k = sub.add_parser("contract", help="machine-readable contract")
     k.add_argument("--json", action="store_true")

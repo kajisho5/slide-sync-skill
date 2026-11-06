@@ -8,7 +8,9 @@ integration test imports a generated PDF, films it with ffmpeg in shuffled order
 and needs ffmpeg-skill, ffmpeg and pypdfium2. Insert unit tests shift timelines and fake ffmpeg-skill; the insert
 integration test splices generated clips into a generated talk with the real ffmpeg-skill. Layout unit tests assign
 layouts to faked match documents; the layout integration test (slides then Q&A) matches and renders a generated talk
-with a generated speaker camera through the real ffmpeg-skill overlay / broll.
+with a generated speaker camera through the real ffmpeg-skill overlay / broll. Clean unit tests decide replace / keep
+on faked match documents; the clean integration test puts the deck pages over a soft, keystoned camera shot of the
+projection with the real ffmpeg-skill insert / broll and measures sharpness.
 
     python -m unittest -v tests/test_slide_sync.py
 """
@@ -44,6 +46,7 @@ from slide_sync.insert import insert_clips, parse_insert, segment_titles, shift_
 from slide_sync import match as match_mod  # noqa: E402
 from slide_sync.match import MATCH_SCHEMA, decide, match, quad_sampler, read_png, sample_times, slide_quad  # noqa: E402
 from slide_sync.layout import LAYOUT_SCHEMA, assign, plan_layout, render_layout, side_band, spans_of  # noqa: E402
+from slide_sync.clean import CLEAN_SCHEMA, decide_segments, page_size, plan_clean, replaced_spans  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -399,6 +402,8 @@ class ContractTests(unittest.TestCase):
         self.assertIn("slides.insert_clips", {p["id"] for p in c["provides"]})
         self.assertIn("slides.layout_plan", {p["id"] for p in c["provides"]})
         self.assertEqual((c["layout"]["schema"], c["layout"]["provenance"]), (LAYOUT_SCHEMA, "DERIVED"))
+        self.assertIn("slides.clean_pages", {p["id"] for p in c["provides"]})
+        self.assertEqual((c["clean"]["schema"], c["clean"]["provenance"]), (CLEAN_SCHEMA, "DERIVED"))
         self.assertTrue({"overlay", "broll"} <= set(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"]))
         self.assertEqual(c["insert"]["provenance"], "DERIVED")
         self.assertTrue({"cut", "join", "insert", "probe"} <= set(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"]))
@@ -616,6 +621,103 @@ class LayoutUnitTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), mock.patch.object(cli, "_engine", return_value=self.SKILL):
             self.assertEqual(cli.main(["layout", self.video, "--match", mfile, "--deck", self.tmp, "--json"]), 2)
             self.assertEqual(cli.main(["layout", self.video, "--match", mfile, "--plan-out", plan, "--json"]), 2)
+
+
+# ------------------------------------------------------------------ clean deck pages (roadmap step 8)
+
+class CleanUnitTests(unittest.TestCase):
+    SKILL = FfmpegSkill("/fake/ffmpeg-skill", "3.0.0", sorted({"look", "metadata", "scenes", "probe", "insert", "broll"}))
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.video = os.path.join(self.tmp, "camera.mp4")
+        Path(self.video).write_bytes(b"x")
+        self.deck = os.path.join(self.tmp, "pages")
+        os.mkdir(self.deck)
+        Path(self.deck, "deck.json").write_text(json.dumps({"schema": DECK_SCHEMA, "pages": [
+            {"index": i, "image": f"page-00{i}.png", "width_px": 1920, "height_px": 1080} for i in (1, 2, 3)]
+            + [{"index": 4, "image": "page-004.png", "width_px": 1024, "height_px": 768}]}), encoding="utf-8")
+        self.runner = LayoutRunner({"camera.mp4": (1280, 720, 40.0)})
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def doc(self, pages, confidences, mixed=()):
+        m = match_doc(pages, [5] * len(pages), deck=self.deck, source=self.video)
+        for s, c in zip(m["segments"], confidences):
+            s["confidence"] = c
+            s["mixed"] = s["index"] in mixed
+        return m
+
+    def test_confident_pages_replace_the_capture_and_the_rest_is_kept(self):
+        m = self.doc([1, 1, 2, None, 3, 2, 4], [0.95, 0.9, 0.75, 0.3, 0.92, 0.97, 0.88], mixed=(6,))
+        p = plan_clean(self.SKILL, self.video, m, output=os.path.join(self.tmp, "out.mp4"), runner=self.runner)
+        self.assertEqual(p["schema"], CLEAN_SCHEMA)
+        self.assertEqual([(d["action"], d["rule"]) for d in p["segments"]],
+                         [("replace", "confident_match"), ("replace", "confident_match"), ("keep", "low_confidence"),
+                          ("keep", "unmatched"), ("replace", "confident_match"), ("keep", "mixed"),
+                          ("replace", "confident_match")])
+        self.assertEqual([(s["page"], s["start"], s["end"], s["segments"]) for s in p["spans"]],
+                         [(1, 0.0, 10.0, [1, 2]), (3, 20.0, 25.0, [5]), (4, 30.0, 35.0, [7])])
+        self.assertEqual([s["tool"] for s in p["steps"]], ["insert", "insert", "insert", "broll"])
+        ins = p["steps"][0]["args"]
+        self.assertEqual(ins[1:9], ["--duration", "10.100", "--width", "1280", "--height", "720", "--fps", "25"])
+        self.assertEqual(ins[0], os.path.join(self.deck, "page-001.png"))
+        self.assertEqual(p["steps"][2]["args"][3:7], ["--width", "960", "--height", "720"])  # 4:3 page in 16:9, padded
+        br = p["steps"][-1]["args"]
+        self.assertEqual(br[0], self.video)
+        self.assertEqual(br[1:7], ["--insert", p["steps"][0]["output"], "--at", "0.000", "--end", "10.000"])
+        self.assertEqual(br[-6:], ["--audio", "a", "--pad-color", "black", "-o", os.path.join(self.tmp, "out.mp4")])
+        self.assertEqual((p["replaced_count"], p["rules"]["unmatched"]), (4, 1))
+        self.assertEqual(p["warnings"], [])
+        r = render_layout(self.SKILL, p, runner=self.runner)
+        self.assertEqual([s["tool"] for s in r["steps"]], ["insert", "insert", "insert", "broll"])
+        self.assertTrue(os.path.isfile(r["output"]))
+        self.assertFalse(any(os.path.exists(s["output"]) for s in p["steps"][:-1]))
+
+    def test_min_confidence_and_nothing_to_replace(self):
+        m = self.doc([1, 2], [0.85, 0.95])
+        self.assertEqual([d["action"] for d in decide_segments(m["segments"], min_confidence=0.9)], ["keep", "replace"])
+        p = plan_clean(self.SKILL, self.video, m, min_confidence=0.99, runner=self.runner)
+        self.assertEqual((p["steps"], p["output"], p["replaced_count"]), ([], None, 0))
+        self.assertTrue(any("nothing to replace" in w for w in p["warnings"]))
+
+    def test_page_size_and_spans(self):
+        self.assertEqual(page_size(16 / 9, 1280, 720), (1280, 720))
+        self.assertEqual(page_size(4 / 3, 1280, 720), (960, 720))
+        self.assertEqual(page_size(16 / 9, 640, 480), (640, 360))
+        d = decide_segments(self.doc([1, 1], [0.9, 0.9])["segments"], min_confidence=0.8)
+        self.assertEqual([(s["start"], s["end"]) for s in replaced_spans(d, duration=7.5)], [(0.0, 7.5)])
+
+    def test_refusals(self):
+        m = self.doc([1], [0.9])
+        for kw, code in (({"min_confidence": 2}, "INVALID_ARGUMENT"), ({"output": self.video}, "OUTPUT_IS_INPUT"),
+                         ({"deck_dir": self.tmp}, "INVALID_DECK")):
+            with self.assertRaises(SlideSyncError) as e:
+                plan_clean(self.SKILL, self.video, m, runner=self.runner, **kw)
+            self.assertEqual(e.exception.code, code, kw)
+        bad = self.doc([7], [0.9])
+        with self.assertRaises(SlideSyncError) as e:
+            plan_clean(self.SKILL, self.video, bad, runner=self.runner)
+        self.assertEqual(e.exception.code, "INVALID_DECK")
+        with self.assertRaises(SlideSyncError):
+            plan_clean(self.SKILL, self.video, {"schema": "x"}, runner=self.runner)
+
+    def test_cli(self):
+        mfile = os.path.join(self.tmp, "match.json")
+        Path(mfile).write_text(json.dumps(self.doc([1, None], [0.9, 0.1])), encoding="utf-8")
+
+        def fake(skill, tool, args, **kw):
+            return run_tool(skill, tool, args, timeout=kw.get("timeout", 60), runner=self.runner)
+        buf = io.StringIO()
+        with mock.patch.object(cli, "_engine", return_value=self.SKILL), mock.patch("slide_sync.layout.run_tool", fake), \
+                redirect_stdout(buf):
+            rc = cli.main(["clean", self.video, "--match", mfile, "-o", os.path.join(self.tmp, "o.mp4"), "--json"])
+        doc = json.loads(buf.getvalue())
+        self.assertEqual((rc, [d["action"] for d in doc["segments"]]), (0, ["replace", "keep"]))
+        self.assertEqual(doc["rendered"]["output"], os.path.join(self.tmp, "o.mp4"))
+        with redirect_stdout(io.StringIO()), mock.patch.object(cli, "_engine", return_value=self.SKILL):
+            self.assertEqual(cli.main(["clean", self.video, "--json"]), 2)
 
 
 # ------------------------------------------------------------------ slide import fixtures (built at test time)
@@ -1492,6 +1594,73 @@ class SlideTalkLayoutTests(unittest.TestCase):
             for t_mid in (13.0, 16.0):                               # Q&A: the speaker, full frame
                 for box in ((0, 0, 640, 360), (560, 10, 60, 30)):
                     self.assertTrue(near(region_colour(out, t_mid, box), green), (t_mid, box))
+
+
+def frame_grey(video, t, size):
+    """The frame at `t` seconds as 8-bit grey rows (fixture check through ffmpeg directly)."""
+    w, h = size
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", video, "-frames:v", "1", "-f", "rawvideo",
+                          "-pix_fmt", "gray", "-"], capture_output=True, check=True).stdout
+    return [raw[y * w:(y + 1) * w] for y in range(h)]
+
+
+def sharpness(rows):
+    """Variance of the 4-neighbour Laplacian (higher is sharper), at half resolution (2 x 2 means) so that sensor noise
+    does not count as detail."""
+    half = [[(a[x] + a[x + 1] + b[x] + b[x + 1]) / 4 for x in range(0, len(a) - 1, 2)] for a, b in zip(rows[0::2], rows[1::2])]
+    vals = []
+    for y in range(1, len(half) - 1):
+        up, row, down = half[y - 1], half[y], half[y + 1]
+        vals += [up[x] + down[x] + row[x - 1] + row[x + 1] - 4 * row[x] for x in range(1, len(row) - 1)]
+    mean = sum(vals) / len(vals)
+    return sum((v - mean) ** 2 for v in vals) / len(vals)
+
+
+@unittest.skipUnless(ENGINE and shutil.which("ffmpeg") and HAS_PDFIUM, "needs ffmpeg-skill, ffmpeg and pypdfium2")
+class CleanPagesTests(unittest.TestCase):
+    """Roadmap step 8's done-when fixture: a soft, keystoned, noisy camera shot of a projection (three deck pages and a
+    backup slide that is not in the deck); import, detect, match and clean with the real ffmpeg-skill."""
+
+    def test_replaced_frames_are_sharper_and_the_unmatched_span_is_left_as_captured(self):
+        with tempfile.TemporaryDirectory() as t:
+            Path(t, "deck.pdf").write_bytes(build_pdf(SHUFFLE_DECK[:3]))
+            Path(t, "extra.pdf").write_bytes(build_pdf([SHUFFLE_EXTRA]))
+            import_deck(os.path.join(t, "deck.pdf"), os.path.join(t, "pages"), dpi=72)
+            import_deck(os.path.join(t, "extra.pdf"), os.path.join(t, "extra"), dpi=72)
+            show = [(os.path.join(t, "pages", "page-001.png"), 4), (os.path.join(t, "pages", "page-002.png"), 4),
+                    (os.path.join(t, "extra", "page-001.png"), 4), (os.path.join(t, "pages", "page-003.png"), 4)]
+            lst = os.path.join(t, "show.txt")
+            Path(lst).write_text("".join(f"file '{f}'\nduration {d}\n" for f, d in show) + f"file '{show[-1][0]}'\n",
+                                 encoding="utf-8")
+            cam, out = os.path.join(t, "camera.mp4"), os.path.join(t, "camera_clean.mp4")
+            vf = ("scale=760:428,pad=960:540:100:56:0x202020,perspective=x0=45:y0=30:x1=920:y1=0:x2=0:y2=540:x3=960:y3=505"
+                  ":sense=destination,gblur=sigma=1.6,noise=alls=10:allf=t,fps=25,format=yuv420p")
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-f", "lavfi", "-i",
+                            "sine=f=440:d=16", "-vf", vf, "-c:v", "libx264", "-crf", "24", "-c:a", "aac", "-shortest", cam],
+                           check=True)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cli.main(["clean", cam, "--deck", os.path.join(t, "pages"), "--plan-out", os.path.join(t, "clean.json"),
+                               "-o", out, "--json", "--ffmpeg-skill", ENGINE.root])
+            doc = json.loads(buf.getvalue())
+            self.assertEqual(rc, 0, doc)
+            self.assertEqual([(d["page"], d["action"], d["rule"]) for d in doc["segments"]],
+                             [(1, "replace", "confident_match"), (2, "replace", "confident_match"),
+                              (None, "keep", "unmatched"), (3, "replace", "confident_match")])
+            self.assertEqual(sorted(os.listdir(t)), sorted(["camera.mp4", "camera_clean.mp4", "clean.json", "deck.pdf",
+                                                            "extra", "extra.pdf", "pages", "show.txt"]))  # no leftovers
+            info = json.loads(subprocess.run(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", out],
+                                             capture_output=True, text=True, check=True).stdout)
+            self.assertAlmostEqual(float(info["format"]["duration"]), 16.0, delta=0.1)
+            self.assertIn("audio", [s["codec_type"] for s in info["streams"]])
+            size = (960, 540)
+            for t_mid in (2.0, 6.0, 14.0):                         # replaced: sharper than the capture
+                before, after = sharpness(frame_grey(cam, t_mid, size)), sharpness(frame_grey(out, t_mid, size))
+                self.assertGreater(after, 2 * before, (t_mid, before, after))  # measured: 3 to 4 times
+            for t_mid in (9.0, 10.0, 11.0):                        # unmatched: left as captured
+                a, b = frame_grey(cam, t_mid, size), frame_grey(out, t_mid, size)
+                diff = sum(abs(x - y) for ra, rb in zip(a, b) for x, y in zip(ra[::4], rb[::4])) / (len(a) * len(a[0]) / 4)
+                self.assertLess(diff, 4.0, t_mid)
 
 
 if __name__ == "__main__":

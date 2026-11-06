@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from . import __version__
+from .clean import CLEAN_SCHEMA, CLEAN_TOOLS, DEFAULT_MIN_CONFIDENCE
+from .clean import RULES as CLEAN_RULES
 from .core import DEFAULT_MIN_DWELL, DEFAULT_THRESHOLD, TIMELINE_SCHEMA
 from .deck import DECK_SCHEMA, DEFAULT_DPI, ENV_SOFFICE, OFFICE_EXTS, TEXT_NORMALISATION
 from .engine import ENV_DIRS, INSERT_TOOLS, REQUIRED_TOOLS
@@ -57,6 +59,14 @@ TOOLS = [
               "[--camera-offset 0]", "[--qa-from <s>]", "[--slides auto|pip|side|full]", "[--unmatched keep|speaker]",
               f"[--pip-position {DEFAULT_PIP_POSITION}]", f"[--pip-width {DEFAULT_PIP_WIDTH:g}]", "[--plan-out <json>]",
               "[-o <video>]", "[--overwrite]", "--json"]},
+    {"tool_id": "slide-sync/clean", "role": "execution", "writes_media": True, "mutates_input": False, "deterministic": True,
+     "description": "The deck page, sharp and at the recording's frame size, over the captured slide for the time match "
+                    "is confident about it (slide-sync/clean@1: replace or keep and the rule per segment, ffmpeg-skill "
+                    "insert per page then one broll); a low-confidence, mixed or unmatched segment keeps the capture; "
+                    "with -o the plan is rendered",
+     "argv": ["clean", "<video>", "--match <match.json> | --deck <dir> [--timeline <timeline.json>]", "[--deck <dir>]",
+              f"[--min-confidence {DEFAULT_MIN_CONFIDENCE:g}]", "[--pad-color black]", "[--plan-out <json>]", "[-o <video>]",
+              "[--overwrite]", "--json"]},
 ]
 
 ERRORS = {
@@ -88,10 +98,12 @@ def contract() -> Dict[str, Any]:
                      {"id": "slides.import", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/import"},
                      {"id": "slides.match", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/match"},
                      {"id": "slides.insert_clips", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/insert"},
-                     {"id": "slides.layout_plan", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/layout"}],
+                     {"id": "slides.layout_plan", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/layout"},
+                     {"id": "slides.clean_pages", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/clean"}],
         "dependencies": [{"id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <4.0.0",
-                          "tools": list(dict.fromkeys(list(REQUIRED_TOOLS) + list(INSERT_TOOLS) + list(LAYOUT_TOOLS))),
-                          "tools_for": {"slide-sync/insert": list(INSERT_TOOLS), "slide-sync/layout": list(LAYOUT_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
+                          "tools": list(dict.fromkeys(list(REQUIRED_TOOLS) + list(INSERT_TOOLS) + list(LAYOUT_TOOLS) + list(CLEAN_TOOLS))),
+                          "tools_for": {"slide-sync/insert": list(INSERT_TOOLS), "slide-sync/layout": list(LAYOUT_TOOLS),
+                                        "slide-sync/clean": list(CLEAN_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
                           + ["~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
                          {"id": "pypdfium2", "kind": "python", "required": False, "extra": "pdf", "version_range": ">=4.30",
                           "licence": "Apache-2.0 OR BSD-3-Clause", "for": ["slide-sync/import"]},
@@ -120,6 +132,10 @@ def contract() -> Dict[str, Any]:
                    "slides": list(SLIDE_MODES), "unmatched": list(UNMATCHED_MODES), "min_side_band": MIN_SIDE_BAND,
                    "steps": "ffmpeg-skill overlay (--video --place) for PiP / side by side, broll for speaker full; "
                             "overlay --place needs ffmpeg-skill 2.13.0 or later", "audio": "the recording's, throughout"},
+        "clean": {"schema": CLEAN_SCHEMA, "provenance": "DERIVED", "rules": dict(CLEAN_RULES),
+                  "min_confidence": DEFAULT_MIN_CONFIDENCE,
+                  "replaced_with": "the imported page image at the recording's frame size, page aspect kept, padded",
+                  "audio": "the recording's, throughout"},
         "deck": {"schema": DECK_SCHEMA, "provenance": "OBSERVED", "default_dpi": DEFAULT_DPI,
                  "text_normalisation": TEXT_NORMALISATION},
         "execution": {"canonical_invocation": ["slide-sync", "<command>", "...", "--json"], "network": False, "shell": False,
