@@ -297,3 +297,42 @@ There is no ffmpeg-skill tool that shrinks the main picture for part of the vide
 - **Sync** is given, not measured (`--camera-offset`).
 - **Side by side** uses only a free band beside a pillarboxed slide; the slide is never moved or shrunk.
 - **Re-encoding.** Each step re-encodes (at ffmpeg-skill's default quality): at most one `overlay` per corner / band and one `broll`.
+
+## ADR-006 Clean deck pages: the page clip over the capture where match is confident (0.8), through ffmpeg-skill insert / broll
+
+Decided 2026-11-06, checked against ffmpeg-skill v2.24.1 and v3.0.0 (`insert.py`, `broll.py`).
+
+### Requirements
+
+`ECOSYSTEM_ROADMAP.md` step 8: where `match` is confident, the captured slide area (located and de-keystoned already) is replaced by the deck page, sharp and at the output size, for the matched time; a low-confidence match keeps the capture. Done when a fixture's replaced frames have higher sharpness than the capture, and an unmatched span is left as captured.
+
+- **Never a wrong page.** Showing a page the speaker did not show is worse than a soft picture, so the bar is above match's own (0.7), and any doubt keeps the capture.
+- **The page as the output.** `match` has already found and straightened the slide to compare it; the clean picture is that slide, straightened, at the output size, which is the deck page itself, rendered from the imported page image (144 dpi by default: 1920 x 1080 for a 16:9 slide).
+- **ffmpeg-skill does the media work.**
+
+### Decision
+
+- **One op, `slide-sync clean <video> --match <json> | --deck <dir> [--min-confidence 0.8] [--pad-color black] [--plan-out <json>] [-o <video>]`.** Without `-o` it prints the plan (`slide-sync/clean@1`); with `-o` it runs it (the same runner as `layout`: intermediates refused if present, removed afterwards).
+- **Per segment, replace or keep, with the rule:**
+
+  | Rule | When | Action |
+  |---|---|---|
+  | `confident_match` | a page, confidence at least `--min-confidence` (0.8), frames agree | replace |
+  | `low_confidence` | a page, but below 0.8 | keep |
+  | `mixed` | the segment's frames showed different pages (a missed change, a build) | keep |
+  | `unmatched` | no page | keep |
+
+  0.8 sits between match's 0.7 and the lowest right-page score measured in ADR-002 (0.86 on the camera fixtures; 0.866 on this step's fixture).
+- **Steps.** Each replaced page becomes a still clip at the recording's frame rate, sized to fit the recording's frame with the page's aspect kept (`insert --duration <longest span + 0.1 s> --width --height --fps`); one `broll` puts the clips over their spans (`--insert <clip> --at --end --from 0`, repeated; `--audio a`, so the recording's sound is untouched; a page of another aspect is padded with `--pad-color`). Consecutive segments on one page are one span. The whole frame shows the page in a replaced span: in a camera shot the room around the projection goes too, which is the point of a clean slide.
+- **Provenance.** DERIVED from the match; `rules` counts each rule, `replaced_count` the replaced segments.
+
+### Evidence
+
+- **Unit (`CleanUnitTests`).** Every rule; two segments of one page merged into one span; the page clip sizes (16:9 at 1280 x 720, 4:3 at 960 x 720 padded); the exact `insert` / `broll` arguments; `--min-confidence`; nothing to replace; a page missing from the deck; rendering in order with intermediates removed; the CLI.
+- **Done-when fixture (`CleanPagesTests`, real ffmpeg-skill v2.24.1 and v3.0.0).** Three imported pages and a backup slide that is not in the deck, filmed by a simulated camera (dark surround, keystone, Gaussian blur sigma 1.6, sensor noise, CRF 24) at 960 x 540 with sound. `clean --deck -o` replaces the three pages (confidence 0.87 to 0.92) and keeps the backup slide (`unmatched`). Sharpness, the variance of the Laplacian at half resolution (2 x 2 means, so noise does not count as detail), is 3 to 4 times the capture's in the replaced frames (the test requires more than 2 times); the unmatched frames differ from the capture by under 4 grey levels on average (broll re-encodes them). Output length and sound are kept, no intermediate is left.
+
+### Limits
+
+- Only what is on the deck page shows: a laser pointer, annotations drawn live, or a video playing inside the slide are gone in a replaced span. Use `--min-confidence 1` (nothing replaced) or keep the capture for such talks; a follow-up could keep segments flagged by detection-skill.
+- Animated builds: a build step matched to the full page shows the full page early.
+- The talk is re-encoded once (broll), plus one short encode per page.
