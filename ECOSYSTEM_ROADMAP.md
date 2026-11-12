@@ -51,5 +51,7 @@ ffmpeg-skill `scenes` (detection, contact sheet), `metadata` (chapters), `look` 
 
 Slide text OCR comes from detection-skill, not a second OCR.
 
+Cut detection is layered ([Velisa ownership decisions 2026-11-12](https://github.com/kajisho5/Velisa/blob/main/docs/ecosystem/DECISION_LOG.md)): slide changes are this repository's layer (`detect`, on ffmpeg-skill `scenes` plus a minimum dwell); the fast list is ffmpeg-skill `scenes`, the observation media-analysis-skill, the frame-accurate shot table detection-skill `shots`, and judgement qc-skill.
+
 ---
 Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (3.x, 42 tools, contract_version 2.0; treated as complete, proposals go to Velisa's ROADMAP). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).
