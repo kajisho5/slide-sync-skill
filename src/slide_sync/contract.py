@@ -94,7 +94,7 @@ def contract() -> Dict[str, Any]:
     return {
         "skill_id": SKILL_ID,
         "id": SKILL_ID,
-        "skill": "slide-sync-skill",
+        "skill": {"id": SKILL_ID, "package": "slide-sync-skill", "version": __version__},
         "version": __version__,
         "contract_version": CONTRACT_VERSION,
         "provides": [{"id": "slides.detect_changes", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/detect"},
@@ -104,18 +104,14 @@ def contract() -> Dict[str, Any]:
                      {"id": "slides.insert_clips", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/insert"},
                      {"id": "slides.layout_plan", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/layout"},
                      {"id": "slides.clean_pages", "lifecycle": "EXPERIMENTAL", "tool_id": "slide-sync/clean"}],
-        "dependencies": [{"id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <4.0.0",
+        # Skill dependencies only (other Skills this one invokes), each with skill_id and version_range: the OS contract
+        # shape (Velisa registry/capability_contract.schema.json, ADR-018). pypdfium2 and LibreOffice are not Skills: they are
+        # under deck.requires, and doctor reports each (docs/decisions.md ADR-008).
+        "dependencies": [{"skill_id": "ffmpeg-skill", "id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <4.0.0",
                           "tools": list(dict.fromkeys(list(REQUIRED_TOOLS) + list(INSERT_TOOLS) + list(LAYOUT_TOOLS) + list(CLEAN_TOOLS))),
                           "tools_for": {"slide-sync/insert": list(INSERT_TOOLS), "slide-sync/layout": list(LAYOUT_TOOLS),
                                         "slide-sync/clean": list(CLEAN_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
-                          + ["~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
-                         {"id": "pypdfium2", "kind": "python", "required": False, "extra": "pdf", "version_range": ">=4.30",
-                          "licence": "Apache-2.0 OR BSD-3-Clause", "for": ["slide-sync/import"]},
-                         {"id": "libreoffice", "kind": "binary", "required": False, "licence": "MPL-2.0",
-                          "for": ["slide-sync/import"],
-                          "formats": [e[1:] for e in OFFICE_EXTS],
-                          "located_by": ["--soffice", f"${ENV_SOFFICE}", "PATH (soffice, libreoffice)",
-                                         "/Applications/LibreOffice.app", "%ProgramFiles%\\LibreOffice"]}],
+                          + ["~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]}],
         "not_provided": ["slide text from images or scanned pages (OCR: detection-skill)",
                          "matching by slide text (OCR of the frames is detection-skill's; match compares pictures)",
                          "running ffmpeg or ffprobe directly (only through ffmpeg-skill)",
@@ -147,6 +143,13 @@ def contract() -> Dict[str, Any]:
                   "replaced_with": "the imported page image at the recording's frame size, page aspect kept, padded",
                   "audio": "the recording's, throughout"},
         "deck": {"schema": DECK_SCHEMA, "provenance": "OBSERVED", "default_dpi": DEFAULT_DPI,
+                 # not Skills, so not under dependencies (ADR-008); doctor reports each under import
+                 "requires": [{"id": "pypdfium2", "kind": "python", "required": False, "extra": "pdf", "version_range": ">=4.30",
+                               "licence": "Apache-2.0 OR BSD-3-Clause", "for": ["slide-sync/import"]},
+                              {"id": "libreoffice", "kind": "binary", "required": False, "licence": "MPL-2.0",
+                               "for": ["slide-sync/import"], "formats": [e[1:] for e in OFFICE_EXTS],
+                               "located_by": ["--soffice", f"${ENV_SOFFICE}", "PATH (soffice, libreoffice)",
+                                              "/Applications/LibreOffice.app", "%ProgramFiles%\\LibreOffice"]}],
                  "text_normalisation": TEXT_NORMALISATION},
         "execution": {"canonical_invocation": ["slide-sync", "<command>", "...", "--json"], "network": False, "shell": False,
                       "engine": "ffmpeg-skill (scripts run with this Python, argv only)",
