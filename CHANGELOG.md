@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 - 2026-11-19
+
+- fix(release): CHANGELOG headings in this file's form; test the release commit before pushing; no release for chore/ci/docs-only changes (#19) (d58b845)
+
 ## 0.1.1 - 2026-11-19
 
 - The contract follows the OS contract shape (Velisa `registry/capability_contract.schema.json`, Velisa ADR-018; ADR-008): `skill` is `{id, package, version}` instead of the package name as a string, and `dependencies` lists only ffmpeg-skill, with `skill_id` added (`id`, `kind`, `version_range`, `tools`, `tools_for` and `located_by` stay). pypdfium2 and LibreOffice, which are not Skills, move unchanged to `deck.requires`; `doctor` reports each under `import` as before. No command, option, output document, tool, capability id or error changed; `contract_version` stays 1.0.
