@@ -26,6 +26,7 @@ jobs:
           set -o pipefail
           python -m unittest -v tests/test_slide_sync.py 2>&1 | tee test.log
           ! grep -q "skipped 'needs pypdfium2'" test.log
+      - run: python contract/generate.py --check
       - run: slide-sync contract --json
 
   integration:

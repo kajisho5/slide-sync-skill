@@ -78,6 +78,8 @@ This skill never runs ffmpeg or ffprobe itself: ffmpeg-skill is its only media b
 | `contract --json` | Machine-readable contract in the OS registry's shape |
 | `doctor --json` | Python, ffmpeg-skill location and version, ffmpeg / ffprobe, and whether `scenes` / `metadata` / `look` are usable (and, for `insert`, `probe` / `cut` / `insert` / `join`, as a note); for import, pypdfium2 and LibreOffice with their install lines (a missing one is a note, not a failure) |
 
+`contract/contract.json` is the contract committed as a file (`slide-sync contract --json` as one line with sorted keys, compact separators and a final newline), so the contract of any commit is `git show <ref>:contract/contract.json`, with nothing installed or run. Regenerate it with `python contract/generate.py`; a unit test fails when it is stale.
+
 Every command prints one JSON document with `--json`. Exit codes: 0 ok, 2 invalid input or arguments (including a file PDFium cannot open, or a deck directory without `deck.json`), 3 ffmpeg-skill, pypdfium2 or LibreOffice missing (or ffmpeg-skill lacking a tool), 4 ffmpeg-skill or LibreOffice failed.
 
 ## Limits
