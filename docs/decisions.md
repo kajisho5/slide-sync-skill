@@ -283,7 +283,7 @@ There is no ffmpeg-skill tool that shrinks the main picture for part of the vide
   A `located` view (a camera on the projection) gives no side band: where the slide sits in the frame is known only as a quadrilateral in match's grid, not to the pixel. `ambiguous` and `below_min_score` are not told apart: either way no page was claimed.
 - **Spans and steps.** Consecutive pieces with one layout become a span. Steps in order: one `overlay` for all PiP spans (`--position <corner> --scale-percent <w>`), one per side-band width (`--position X,Y --margin 0 --scale <band>`), then one `broll` (`--audio a`) for all speaker-full spans. Each step reads the previous one's output; intermediates are `<output>.layout-stepN.<ext>`, refused if they already exist and removed after the run. Camera time is recording time plus `--camera-offset`, in `--place` and `--from`.
 - **Audio.** The recording's, throughout (`overlay` keeps the main audio; `broll --audio a`). The speaker camera's own sound is not used.
-- **Version.** `--place` came in ffmpeg-skill 2.13.0: the plan warns and rendering refuses (`ENGINE_TOOL_MISSING`) on an older one. The contract's range stays `>=2.0.0 <4.0.0` (ADR-004) for the other commands.
+- **Version.** `--place` came in ffmpeg-skill 2.13.0: the plan warns and rendering refuses (`ENGINE_TOOL_MISSING`) on an older one. The contract's range stays `>=2.0.0 <4.0.0` (ADR-004; `<5.0.0` since ADR-011) for the other commands.
 - **Provenance.** The plan is DERIVED from the match (`derived_from`: its path, source, deck, segment and matched counts).
 
 ### Evidence
@@ -468,3 +468,29 @@ Today's release commits wrote CHANGELOG.md headings as `## vX.Y.Z - date`. Every
 
 - A version bumped by hand in a pull request is released whatever its labels.
 - A release that fails the tests is not made; a later push retries.
+
+## ADR-011 ffmpeg-skill 4.x accepted (`>=2.0.0 <5.0.0`)
+
+2026-11-20. Checked against ffmpeg-skill v4.0.0 (CHANGELOG "4.0.0", the 3.15.1 to 4.0.0 contract diff).
+
+### What 4.0.0 changed, and what reaches this skill
+
+`contract_version` stays 2.0, and no tool or flag was removed. Python 3.10+ and FFmpeg 6.1+ are unchanged from 3.x.
+
+| 4.0.0 change | Reaches this skill? |
+|---|---|
+| `export`: platform presets normalise loudness by default (`--no-normalize` new); an unmet required field exits 1 with `kind: verification` | No: `export` is never called |
+| `fit`: `--method` required for a retime beyond 1.15x (`fit_method_required`) | No: `fit` is never called |
+| `join --copy`: AAC drift over 50 ms refused (`join_copy_mismatch`) | No: `insert` joins with `--transition none --width --height --fps`, a re-encode, never `--copy` |
+| `waveform`: audio re-encode conditional | No: `waveform` is never called |
+| `caption` / `silence --transcribe`: `english_only` refusal | No: neither is called |
+| Per-tool stability: `probe`, `cut`, `look` are `stable`; `scenes`, `metadata`, `insert`, `join`, `overlay`, `broll` are `beta` | Not now: every flag passed here is unchanged in 4.0.0. A `beta` flag or key may change in a 4.x minor after one minor in `deprecated`; the CI leg pins `v4.0.0`, so such a change shows when a later 4.x tag is added there |
+
+### Decision
+
+- **Range `>=2.0.0 <5.0.0`** in the contract. No 4.0-only flag is passed and no version branch is added.
+- **CI** runs the integration job against `v2.24.1`, `v3.0.0` and `v4.0.0`.
+
+### Consequences
+
+The contract's `dependencies[ffmpeg-skill].version_range` changes, so a byte-for-byte pin of this contract needs a re-pin. No command, option, output document or `contract_version` changed.
