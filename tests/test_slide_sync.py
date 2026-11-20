@@ -412,7 +412,7 @@ class ContractTests(unittest.TestCase):
         self.assertTrue({"cut", "join", "insert", "probe"} <= set(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"]))
         self.assertIn("look", next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["tools"])
         # ffmpeg-skill 3.x accepted (ADR-004): the tools and keys used here did not change in 3.0.0
-        self.assertEqual(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["version_range"], ">=2.0.0 <4.0.0")
+        self.assertEqual(next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")["version_range"], ">=2.0.0 <5.0.0")
         self.assertEqual(c["match"]["schema"], MATCH_SCHEMA)
         # Skills only, in the OS contract shape (ADR-008); pypdfium2 and LibreOffice are under deck.requires
         self.assertEqual([(d["skill_id"], d["id"], d["kind"]) for d in c["dependencies"]], [("ffmpeg-skill", "ffmpeg-skill", "skill")])

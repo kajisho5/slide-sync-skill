@@ -107,7 +107,7 @@ def contract() -> Dict[str, Any]:
         # Skill dependencies only (other Skills this one invokes), each with skill_id and version_range: the OS contract
         # shape (Velisa registry/capability_contract.schema.json, ADR-018). pypdfium2 and LibreOffice are not Skills: they are
         # under deck.requires, and doctor reports each (docs/decisions.md ADR-008).
-        "dependencies": [{"skill_id": "ffmpeg-skill", "id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <4.0.0",
+        "dependencies": [{"skill_id": "ffmpeg-skill", "id": "ffmpeg-skill", "kind": "skill", "required": True, "version_range": ">=2.0.0 <5.0.0",
                           "tools": list(dict.fromkeys(list(REQUIRED_TOOLS) + list(INSERT_TOOLS) + list(LAYOUT_TOOLS) + list(CLEAN_TOOLS))),
                           "tools_for": {"slide-sync/insert": list(INSERT_TOOLS), "slide-sync/layout": list(LAYOUT_TOOLS),
                                         "slide-sync/clean": list(CLEAN_TOOLS)}, "located_by": ["--ffmpeg-skill"] + [f"${e}" for e in ENV_DIRS]
