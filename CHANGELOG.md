@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3 - 2026-11-20
+
+- fix: accept ffmpeg-skill 4.x (>=2.0.0 <5.0.0) (#21) (73bc4ec)
+- ci: Velisa's reusable changelog-check/release-guard; dependencies PRs release a patch (D36, D37) (#20) (91b12dc)
+
 ## 0.1.2 - 2026-11-19
 
 - fix(release): CHANGELOG headings in this file's form; test the release commit before pushing; no release for chore/ci/docs-only changes (#19) (d58b845)
