@@ -26,6 +26,8 @@ jobs:
           set -o pipefail
           python -m unittest -v tests/test_slide_sync.py 2>&1 | tee test.log
           ! grep -q "skipped 'needs pypdfium2'" test.log
+      - name: Release gate tests (Velisa ADR-031 section 5)
+        run: python -m unittest -v tests/test_release_gate_major.py
       - run: python contract/generate.py --check
       - run: slide-sync contract --json
 
